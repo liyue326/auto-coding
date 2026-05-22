@@ -24,4 +24,3 @@ output/run_YYYYMMDD_HHMMSS/
 - 后端合并到 `{MERGE_TARGET_ROOT}/{MERGE_BACKEND_SUBDIR}/`
 - 前端合并到 `{MERGE_TARGET_ROOT}/{MERGE_FRONTEND_SUBDIR}/`
 - `MERGE_ENABLED=true` 时 Deliver 节点自动拷贝；Streamlit 侧边栏可覆盖
-- `MERGE_CONFLICT_MODE=manual` 时冲突导出到 `{主项目}/.merge_conflicts/<run>/`，需人工合并

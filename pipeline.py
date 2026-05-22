@@ -20,14 +20,6 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
 import config as cfg
-from observability import (
-    graph_run_config,
-    llm_run_config,
-    log_pipeline_run,
-    setup_langsmith,
-    traceable_node,
-    traceable_tool,
-)
 from prompts import build_system, build_user
 
 # ── 日志 ────────────────────────────────────────────────────────────────
@@ -37,9 +29,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("multi-agent")
-
-# LangSmith 观测（LANGCHAIN_TRACING_V2=true 时生效）
-_LANGSMITH_ON = setup_langsmith()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -67,6 +56,7 @@ class DevState(TypedDict, total=False):
     merge_enabled: bool
     merge_backend_subdir: str
     merge_frontend_subdir: str
+    merge_conflict_mode: str
     merge_result: dict
 
     # Supervisor 产出
@@ -209,20 +199,29 @@ def write_artifacts(out_dir: Path, state: DevState) -> None:
     )
 
 
-def _merge_conflict_mode(overwrite: bool | None = None) -> str:
-    """解析冲突模式（MERGE_OVERWRITE=false 时等价于 skip）。"""
+def _merge_conflict_mode(
+    overwrite: bool | None = None,
+    conflict_mode: str | None = None,
+) -> str:
+    """
+    解析合并冲突策略。
+    MERGE_OVERWRITE=true（默认）时采用 overwrite，已存在文件也会被新代码覆盖。
+    仅当 MERGE_OVERWRITE=false 时，才使用 MERGE_CONFLICT_MODE（如 manual）。
+    """
+    if conflict_mode:
+        mode = conflict_mode.strip().lower()
+        if mode in ("overwrite", "skip", "backup", "manual"):
+            return mode
     if overwrite is False:
         return "skip"
     if overwrite is True:
         return "overwrite"
-    mode = cfg.MERGE_CONFLICT_MODE
-    if not cfg.MERGE_OVERWRITE and mode == "overwrite":
-        return "skip"
-    return mode
+    if cfg.MERGE_OVERWRITE:
+        return "overwrite"
+    return cfg.MERGE_CONFLICT_MODE
 
 
 def _files_differ(src: Path, dst: Path) -> bool:
-    """比较两文件内容是否不同（用于冲突检测）。"""
     try:
         if src.stat().st_size != dst.stat().st_size:
             return True
@@ -239,11 +238,6 @@ def _stage_manual_conflict(
     src_file: Path,
     dst_file: Path,
 ) -> Path:
-    """
-    将冲突双方导出到 .merge_conflicts/<run>/<label>/<path>/
-      *.current  — 主项目现有文件
-      *.incoming — 本次生成的新文件
-    """
     conflict_dir = target_root / ".merge_conflicts" / run_name / label / rel.parent
     conflict_dir.mkdir(parents=True, exist_ok=True)
     current = conflict_dir / f"{rel.name}.current"
@@ -253,7 +247,6 @@ def _stage_manual_conflict(
     return conflict_dir
 
 
-@traceable_tool("Merge", "tool")
 def merge_to_project(
     source_run_dir: Path,
     target_root: Path,
@@ -265,15 +258,14 @@ def merge_to_project(
     """
     将 output/run_xxx 下的 backend/、frontend/ 合并到可配置主项目目录。
 
-    冲突策略 conflict_mode:
-    - manual: 检测内容差异，冲突不覆盖，导出 .current/.incoming 供人工合并
-    - overwrite: 直接覆盖已存在文件
-    - skip: 目标已存在则跳过（保留旧文件）
-    - backup: 覆盖前将旧文件备份为 文件名.bak
+    conflict_mode / 环境变量:
+    - overwrite: 覆盖已存在文件（MERGE_OVERWRITE=true 时的默认行为）
+    - manual: 内容不同则不覆盖，导出 .current / .incoming 到 .merge_conflicts/
+    - skip: 已存在则跳过 | backup: 覆盖前备份 .bak
     """
     backend_subdir = backend_subdir or cfg.MERGE_BACKEND_SUBDIR
     frontend_subdir = frontend_subdir or cfg.MERGE_FRONTEND_SUBDIR
-    mode = conflict_mode or _merge_conflict_mode(overwrite)
+    mode = _merge_conflict_mode(overwrite, conflict_mode)
 
     result: dict = {
         "ok": False,
@@ -346,7 +338,7 @@ def merge_to_project(
                         }
                     )
                     logger.warning(
-                        "合并冲突[%s]: %s（已导出 .current / .incoming 供人工处理）",
+                        "合并冲突[%s]: %s（已导出 .current / .incoming）",
                         label,
                         rel,
                     )
@@ -389,8 +381,8 @@ def merge_to_project(
                 "frontend": result["frontend_files"],
             },
             "how_to_resolve": (
-                "每个冲突目录含 .current（主项目现有）与 .incoming（新生成）。"
-                "人工合并后，将结果写回主项目对应路径，再删除 .merge_conflicts 下该条记录。"
+                "每个冲突含 .current（主项目现有）与 .incoming（新生成）。"
+                "人工合并后写回主项目对应路径；或设置 MERGE_CONFLICT_MODE=overwrite 重新合并。"
             ),
         }
         report_path.write_text(
@@ -404,21 +396,21 @@ def merge_to_project(
         fe_n = sum(1 for p in fe_src.rglob("*") if p.is_file()) if fe_src.is_dir() else 0
         if be_n == 0 and fe_n == 0:
             result["error"] = (
-                f"源目录无 backend/frontend 代码文件: {source_run_dir} "
-                "(backend/、frontend/ 目录存在但为空，请确认 Deliver 已先写入 output)"
+                f"源目录无 backend/frontend 代码: {source_run_dir} "
+                "(请先确认 Deliver 已写入 output)"
             )
         elif conflict_n:
             result["error"] = (
-                f"存在 {conflict_n} 个文件冲突，需人工合并。"
-                f"报告: {result.get('conflicts_report')}"
+                f"存在 {conflict_n} 个冲突未写入主项目 → {result.get('conflicts_report')}"
             )
         elif result["skipped"]:
-            result["error"] = f"全部 {len(result['skipped'])} 个文件因冲突被跳过(mode=skip)"
+            result["error"] = f"全部 {len(result['skipped'])} 个文件被跳过 (mode={mode})"
         else:
             result["error"] = "未拷贝任何文件，请检查源目录与权限"
     elif conflict_n:
         result["error"] = (
-            f"部分合并完成，仍有 {conflict_n} 个冲突待人工处理 → {result.get('conflicts_report')}"
+            f"部分合并完成，{conflict_n} 个已存在文件待人工处理 → "
+            f"{result.get('conflicts_report')}"
         )
     return result
 
@@ -430,7 +422,7 @@ def merge_from_run(
     frontend_subdir: str = "",
     conflict_mode: str | None = None,
 ) -> dict:
-    """手动将指定 output/run_xxx 合并到主项目（界面未勾选合并时可补救）。"""
+    """将指定 output/run_xxx 再次合并到主项目（可指定 overwrite/manual）。"""
     return merge_to_project(
         Path(run_dir),
         cfg.resolve_merge_target(merge_target),
@@ -476,14 +468,7 @@ def _get_chat_llm():
     )
 
 
-def _invoke_llm(
-    system: str,
-    user: str,
-    on_token: Any = None,
-    *,
-    agent: str = "LLM",
-    **metric_meta: Any,
-) -> str:
+def _invoke_llm(system: str, user: str, on_token: Any = None) -> str:
     if cfg.USE_MOCK_LLM:
         text = _mock_llm_response(system, user)
         if on_token:
@@ -491,31 +476,28 @@ def _invoke_llm(
         return text
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
-        from langchain_core.runnables import RunnableConfig
 
         llm = _get_chat_llm()
         messages = [SystemMessage(content=system), HumanMessage(content=user)]
-        run_cfg = RunnableConfig(**llm_run_config(agent, **metric_meta))
         if on_token:
             parts: list[str] = []
-            for chunk in llm.stream(messages, config=run_cfg):
+            for chunk in llm.stream(messages):
                 delta = chunk.content or ""
                 if delta:
                     parts.append(delta)
                     on_token(delta)
             return "".join(parts)
-        resp = llm.invoke(messages, config=run_cfg)
+        resp = llm.invoke(messages)
         return resp.content or ""
     except Exception as e:
         logger.error("LLM 调用失败: %s", e)
         if cfg.USE_MOCK_LLM:
-            logger.warning("Mock 模式已开启，回退 Mock 响应")
+            logger.warning("Mock 模式已开启，回退本地模板")
             return _mock_llm_response(system, user)
         raise
 
 
 def _requirement_from_prompt(user: str) -> str:
-    """从 user prompt 中提取「业务需求」正文（Mock / 重试共用）。"""
     m = re.search(r"##\s*业务需求[^\n]*\n([\s\S]*?)(?:\n##\s|\Z)", user)
     if m:
         return m.group(1).strip()
@@ -526,7 +508,6 @@ def _requirement_from_prompt(user: str) -> str:
 
 
 def _mock_agent_role(system: str) -> str:
-    """按 system 首段角色句识别 Agent，避免 Skill 里出现 Supervisor 等词误判。"""
     head = (system or "")[:800]
     if "你是 Supervisor 调度 Agent" in head:
         return "supervisor"
@@ -544,7 +525,7 @@ def _mock_agent_role(system: str) -> str:
 
 
 def _mock_llm_response(system: str, user: str) -> str:
-    """无 API Key 时的可运行演示逻辑（按需求原文生成占位产物，不写死业务类型）。"""
+    """Mock：按需求原文与 scope 生成，不写死登录/注册。"""
     req = _requirement_from_prompt(user)
     role = _mock_agent_role(system)
     if role == "supervisor":
@@ -556,18 +537,14 @@ def _mock_llm_response(system: str, user: str) -> str:
                 "dev_scope": scope,
                 "tasks": tasks,
                 "api_contract": {},
-                "notes": f"Mock 编排: {req[:80]}",
+                "notes": f"Mock: {req[:80]}",
             },
             ensure_ascii=False,
         )
     if role == "backend":
         safe = req.replace('"', "'")[:200]
         return json.dumps(
-            {
-                "files": {
-                    "README.md": f"# Mock 后端占位\n\n按需求实现: {safe}\n",
-                }
-            },
+            {"files": {"README.md": f"# Mock 后端\n\n需求: {safe}\n"}},
             ensure_ascii=False,
         )
     if role == "frontend":
@@ -576,8 +553,7 @@ def _mock_llm_response(system: str, user: str) -> str:
             {
                 "files": {
                     "src/App.vue": (
-                        "<template><main class=\"page\"><h1>{{ title }}</h1>"
-                        "<p class=\"hint\">Mock 占位，请配置 API Key 后由模型按需求生成真实代码</p></main></template>\n"
+                        "<template><main class=\"page\"><h1>{{ title }}</h1></main></template>\n"
                         f"<script setup>\nconst title = \"{safe}\";\n</script>\n"
                         "<style scoped>.page { padding: 2rem; }</style>\n"
                     ),
@@ -586,23 +562,21 @@ def _mock_llm_response(system: str, user: str) -> str:
             ensure_ascii=False,
         )
     if role == "code_review":
-        return json.dumps({"score": 82, "issues": [], "passed": True}, ensure_ascii=False)
+        return json.dumps({"score": 85, "issues": [], "passed": True}, ensure_ascii=False)
     if role == "test":
         return json.dumps(
             {"passed": True, "cases_run": 0, "failed": 0, "defects": [], "summary": "mock"},
             ensure_ascii=False,
         )
     if role == "bug_fix":
-        return "MOCK_FIX_OK"
+        return json.dumps({"files": {}}, ensure_ascii=False)
     return "MOCK_OK"
 
 
 def _parse_files_from_llm(raw: str) -> dict[str, str]:
-    """从 LLM 回复解析 files 字典：JSON files 或 markdown 代码块。"""
     text = (raw or "").strip()
     if not text or text in ("MOCK_BACKEND_OK", "MOCK_FRONTEND_OK", "MOCK_FIX_OK", "MOCK_OK"):
         return {}
-
     data = _parse_json_from_llm(text)
     files = data.get("files") if isinstance(data, dict) else None
     if isinstance(files, dict) and files:
@@ -616,8 +590,6 @@ def _parse_files_from_llm(raw: str) -> dict[str, str]:
                 out[p] = body
         if out:
             return out
-
-    # markdown 代码块: 首行可能是路径
     out = {}
     for m in re.finditer(r"```[^\n]*\n([\s\S]*?)```", text):
         block = m.group(0)
@@ -630,9 +602,10 @@ def _parse_files_from_llm(raw: str) -> dict[str, str]:
     return out
 
 
-_STRICT_JSON_REMINDER = """
-【重要】必须严格按用户原文实现，禁止擅自改成登录/注册/笔记/待办/增删改查等其它业务。
-仅输出 JSON：{"files": {"相对路径": "完整文件内容"}}，不要 markdown 包裹。"""
+_STRICT_JSON_REMINDER = (
+    "【重要】严格按用户原文实现，禁止改成登录/注册/笔记/待办等其它业务。"
+    '仅输出 JSON：{"files": {"相对路径": "完整文件内容"}}'
+)
 
 
 def _dev_llm_generate(
@@ -640,65 +613,25 @@ def _dev_llm_generate(
     system: str,
     user: str,
     requirement: str,
-) -> tuple[dict[str, str], str, str]:
-    """
-    调用 LLM 生成代码文件；解析失败则带需求原文重试一次。
-    返回 (files, code_source, raw_last)。
-    code_source: llm | failed
-    不使用任何写死的业务模板兜底。
-    """
-    raw = _invoke_llm(system, user, agent=agent, requirement=requirement[:200])
+) -> tuple[dict[str, str], str]:
+    raw = _invoke_llm(system, user)
     parsed = _parse_files_from_llm(raw)
     if parsed:
         logger.info("%s LLM 生成 %d 个文件", agent, len(parsed))
-        return parsed, "llm", raw
-
+        return parsed, "llm"
     retry_user = (
-        user
-        + "\n\n"
-        + _STRICT_JSON_REMINDER
-        + f"\n用户原文需求（必须逐字落实）：\n{requirement}"
+        user + "\n\n" + _STRICT_JSON_REMINDER + f"\n用户原文需求：\n{requirement}"
     )
-    logger.warning("%s 首次未解析出 files，带需求原文重试", agent)
-    raw2 = _invoke_llm(system, retry_user, agent=agent, requirement=requirement[:200])
+    logger.warning("%s 首次未解析出 files，重试", agent)
+    raw2 = _invoke_llm(system, retry_user)
     parsed2 = _parse_files_from_llm(raw2)
     if parsed2:
-        return parsed2, "llm", raw2
-
-    logger.error("%s 两次均未解析出有效 files JSON，不写入模板代码", agent)
-    return {}, "failed", raw2 or raw
-
-
-# ═══════════════════════════════════════════════════════════════════════
-# 3. 各角色 Agent 节点（含重试包装）
-# ═══════════════════════════════════════════════════════════════════════
-def _with_retry(fn, attempts: int | None = None):
-    attempts = attempts or cfg.NODE_RETRY_ATTEMPTS
-    fn = traceable_node(fn)
-
-    def wrapped(state: DevState) -> dict:
-        last_err = None
-        for i in range(1, attempts + 1):
-            try:
-                return fn(state)
-            except Exception as e:
-                last_err = e
-                logger.warning("%s 第 %s 次失败: %s", fn.__name__, i, e)
-                time.sleep(0.3 * i)
-        return {
-            "errors": [f"{fn.__name__}: {last_err}"],
-            "logs": [f"[retry] {fn.__name__} 在 {attempts} 次后仍失败"],
-        }
-
-    wrapped.__name__ = fn.__name__
-    return wrapped
+        return parsed2, "llm"
+    logger.error("%s 未解析出 files JSON，不写入模板", agent)
+    return {}, "failed"
 
 
 def _resolve_dev_scope(requirement: str, tasks: list[dict], data: dict) -> str:
-    """
-    决定本次跑哪些开发 Agent。
-    优先: Supervisor 输出的 scope → 需求关键词 → tasks 里的 role。
-    """
     scope_raw = (data.get("scope") or data.get("dev_scope") or "").strip().lower()
     if scope_raw in ("frontend_only", "frontend", "fe_only", "fe"):
         return "frontend_only"
@@ -709,30 +642,13 @@ def _resolve_dev_scope(requirement: str, tasks: list[dict], data: dict) -> str:
 
     req = requirement.lower()
     fe_only = (
-        "只写前端",
-        "仅前端",
-        "只要前端",
-        "只做前端",
-        "只开发前端",
-        "仅开发前端",
-        "前端页面即可",
-        "不写后端",
-        "不要后端",
-        "无需后端",
-        "only frontend",
-        "frontend only",
+        "只写前端", "仅前端", "只要前端", "只做前端", "只开发前端", "仅开发前端",
+        "前端页面即可", "不写后端", "不要后端", "无需后端", "只用前端",
+        "only frontend", "frontend only",
     )
     be_only = (
-        "只写后端",
-        "仅后端",
-        "只要后端",
-        "只做后端",
-        "只开发后端",
-        "不写前端",
-        "不要前端",
-        "无需前端",
-        "only backend",
-        "backend only",
+        "只写后端", "仅后端", "只要后端", "只做后端", "只开发后端",
+        "不写前端", "不要前端", "无需前端", "only backend", "backend only",
     )
     if any(k in req for k in fe_only):
         return "frontend_only"
@@ -761,6 +677,30 @@ def _default_tasks_for_scope(scope: str, requirement: str = "") -> list[dict]:
     ]
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# 3. 各角色 Agent 节点（含重试包装）
+# ═══════════════════════════════════════════════════════════════════════
+def _with_retry(fn, attempts: int | None = None):
+    attempts = attempts or cfg.NODE_RETRY_ATTEMPTS
+
+    def wrapped(state: DevState) -> dict:
+        last_err = None
+        for i in range(1, attempts + 1):
+            try:
+                return fn(state)
+            except Exception as e:
+                last_err = e
+                logger.warning("%s 第 %s 次失败: %s", fn.__name__, i, e)
+                time.sleep(0.3 * i)
+        return {
+            "errors": [f"{fn.__name__}: {last_err}"],
+            "logs": [f"[retry] {fn.__name__} 在 {attempts} 次后仍失败"],
+        }
+
+    wrapped.__name__ = fn.__name__
+    return wrapped
+
+
 def node_supervisor(state: DevState) -> dict:
     """Supervisor: 任务拆分、API 契约、流程管控。"""
     updates = _log(state, "Supervisor", "开始任务拆分与流程编排")
@@ -781,27 +721,25 @@ def node_supervisor(state: DevState) -> dict:
         requirement=req,
         legacy_info=json.dumps(legacy_info, ensure_ascii=False)[:2000],
     )
-    raw = _invoke_llm(system, user, agent="Supervisor")
+    raw = _invoke_llm(system, user)
     data = _parse_json_from_llm(raw)
 
     tasks = data.get("tasks") or []
     dev_scope = _resolve_dev_scope(req, tasks, data)
     if not tasks:
         tasks = _default_tasks_for_scope(dev_scope, req)
-    else:
-        # 按 scope 过滤与需求不符的子任务
-        if dev_scope == "frontend_only":
-            tasks = [t for t in tasks if (t.get("role") or "").lower() in ("frontend", "fe", "前端")]
-            if not tasks:
-                tasks = _default_tasks_for_scope("frontend_only", req)
-        elif dev_scope == "backend_only":
-            tasks = [t for t in tasks if (t.get("role") or "").lower() in ("backend", "be", "后端")]
-            if not tasks:
-                tasks = _default_tasks_for_scope("backend_only", req)
+    elif dev_scope == "frontend_only":
+        tasks = [t for t in tasks if (t.get("role") or "").lower() in ("frontend", "fe", "前端")]
+        if not tasks:
+            tasks = _default_tasks_for_scope("frontend_only", req)
+    elif dev_scope == "backend_only":
+        tasks = [t for t in tasks if (t.get("role") or "").lower() in ("backend", "be", "后端")]
+        if not tasks:
+            tasks = _default_tasks_for_scope("backend_only", req)
 
     contract = data.get("api_contract")
     if contract is None:
-        contract = {} if dev_scope != "fullstack" else {}
+        contract = {}
 
     payload = {
         "tasks": tasks,
@@ -816,7 +754,7 @@ def node_supervisor(state: DevState) -> dict:
             "dev_scope": dev_scope,
             **_save_agent_output(state, "Supervisor", payload),
             "logs": updates.get("logs", [])
-            + [f"[Supervisor] 开发范围 dev_scope={dev_scope}，子任务 {len(tasks)} 个"],
+            + [f"[Supervisor] dev_scope={dev_scope}，子任务 {len(tasks)} 个"],
         }
     )
     logger.info("Supervisor scope=%s tasks=%d", dev_scope, len(tasks))
@@ -824,7 +762,7 @@ def node_supervisor(state: DevState) -> dict:
 
 
 def node_backend_dev(state: DevState) -> dict:
-    """后端开发 Agent: 数据表、接口、服务层。"""
+    """后端开发 Agent: 按需求生成代码（无写死模板）。"""
     updates = _log(state, "BackendDev", "开始后端开发", set_phase=False)
     req = state.get("requirement", "")
     contract = state.get("api_contract", {})
@@ -837,7 +775,7 @@ def node_backend_dev(state: DevState) -> dict:
         api_contract=json.dumps(contract, ensure_ascii=False),
         stack_hint=legacy.get("stack_hint", "python"),
     )
-    files, code_source, _ = _dev_llm_generate("BackendDev", system, user, req)
+    files, code_source = _dev_llm_generate("BackendDev", system, user, req)
 
     updates.update(
         {
@@ -851,25 +789,25 @@ def node_backend_dev(state: DevState) -> dict:
     )
     if code_source == "failed":
         updates["logs"] = updates.get("logs", []) + [
-            "[BackendDev] 未生成代码：模型未返回可解析的 files JSON，请查看 LangSmith/终端或简化需求"
+            "[BackendDev] 模型未返回可解析 files JSON"
         ]
-    logger.info("BackendDev 产出 %d 个文件", len(files))
+    logger.info("BackendDev 产出 %d 个文件 source=%s", len(files), code_source)
     return updates
 
 
 def node_frontend_dev(state: DevState) -> dict:
-    """前端开发 Agent: 页面、路由、请求、交互。"""
+    """前端开发 Agent: 按需求生成代码（无写死模板）。"""
     updates = _log(state, "FrontendDev", "开始前端开发", set_phase=False)
     contract = state.get("api_contract", {})
-
     req = state.get("requirement", "")
+
     system = build_system("frontend")
     user = build_user(
         "frontend",
         api_contract=json.dumps(contract, ensure_ascii=False),
         requirement=req,
     )
-    files, code_source, _ = _dev_llm_generate("FrontendDev", system, user, req)
+    files, code_source = _dev_llm_generate("FrontendDev", system, user, req)
 
     updates.update(
         {
@@ -883,9 +821,9 @@ def node_frontend_dev(state: DevState) -> dict:
     )
     if code_source == "failed":
         updates["logs"] = updates.get("logs", []) + [
-            "[FrontendDev] 未生成代码：模型未返回可解析的 files JSON，请查看 LangSmith/终端或简化需求"
+            "[FrontendDev] 模型未返回可解析 files JSON"
         ]
-    logger.info("FrontendDev 产出 %d 个文件", len(files))
+    logger.info("FrontendDev 产出 %d 个文件 source=%s", len(files), code_source)
     return updates
 
 
@@ -900,7 +838,6 @@ def node_code_review(state: DevState) -> dict:
     score = 100
     scope = state.get("dev_scope") or "fullstack"
 
-    # 规则化静态检查：只验证「本次 scope 是否有交付」，不按固定业务类型要求文件结构
     if scope in ("fullstack", "backend_only") and not backend:
         issues.append({"severity": "high", "msg": "未生成任何后端文件"})
         score -= 40
@@ -914,7 +851,6 @@ def node_code_review(state: DevState) -> dict:
         score -= 15
 
     contract_str = json.dumps(contract, ensure_ascii=False)
-
     static_score = max(0, min(100, score))
 
     system = build_system("code_review")
@@ -927,9 +863,7 @@ def node_code_review(state: DevState) -> dict:
         frontend_files=list(frontend.keys()),
         api_contract=contract_str[:1500],
     )
-    raw = _invoke_llm(
-        system, user, agent="CodeReview", static_score=static_score
-    )
+    raw = _invoke_llm(system, user)
     llm_review = _parse_json_from_llm(raw)
     logger.info("CodeReview LLM 原始回复前200字: %s", (raw or "")[:200])
 
@@ -993,7 +927,7 @@ def node_test(state: DevState) -> dict:
         frontend_files=list(frontend.keys()),
         api_contract=json.dumps(state.get("api_contract") or {}, ensure_ascii=False)[:1500],
     )
-    _invoke_llm(system, user, agent="TestAgent")
+    _invoke_llm(system, user)
 
     defects: list[dict] = []
     scope = state.get("dev_scope") or "fullstack"
@@ -1006,14 +940,14 @@ def node_test(state: DevState) -> dict:
                 {
                     "id": f"D-fe-{path}",
                     "module": "frontend",
-                    "desc": f"{path} 中密码输入建议设置 type=password",
+                    "desc": f"{path} 密码框建议 type=password",
                 }
             )
 
     passed = len(defects) == 0
     result = {
         "passed": passed,
-        "cases_run": 0 if not test_files else len(test_files),
+        "cases_run": len(test_files),
         "failed": len(defects),
         "defects": defects,
         "test_files": list(test_files.keys()),
@@ -1046,14 +980,10 @@ def node_bug_fix(state: DevState) -> dict:
     user = build_user(
         "bug_fix",
         defects=json.dumps(defects, ensure_ascii=False),
-        backend_files=json.dumps(
-            {k: v[:3000] for k, v in backend.items()}, ensure_ascii=False
-        ),
-        frontend_files=json.dumps(
-            {k: v[:3000] for k, v in frontend.items()}, ensure_ascii=False
-        ),
+        backend_files=json.dumps({k: v[:3000] for k, v in backend.items()}, ensure_ascii=False),
+        frontend_files=json.dumps({k: v[:3000] for k, v in frontend.items()}, ensure_ascii=False),
     )
-    raw = _invoke_llm(system, user, agent="BugFix", defect_count=len(defects))
+    raw = _invoke_llm(system, user)
     patched = _parse_files_from_llm(raw)
     if patched:
         for path, content in patched.items():
@@ -1061,7 +991,6 @@ def node_bug_fix(state: DevState) -> dict:
                 frontend[path] = content
             else:
                 backend[path] = content
-        logger.info("BugFix 通过 LLM 更新 %d 个文件", len(patched))
     else:
         for d in defects:
             if d.get("module") == "frontend" and "password" in d.get("desc", "").lower():
@@ -1082,15 +1011,7 @@ def node_bug_fix(state: DevState) -> dict:
             "backend_files": backend,
             "frontend_files": frontend,
             "fix_round": fix_round,
-            **_save_agent_output(
-                state,
-                "BugFix",
-                {
-                    "fixed": [d["id"] for d in defects],
-                    "round": fix_round,
-                    "llm_patched": list(patched.keys()) if patched else [],
-                },
-            ),
+            **_save_agent_output(state, "BugFix", {"fixed": [d["id"] for d in defects], "round": fix_round}),
         }
     )
     logger.info("BugFix 第 %s 轮完成", fix_round)
@@ -1103,8 +1024,6 @@ def node_deliver(state: DevState) -> dict:
     out = _ensure_output_dir(state)
     state_for_write = dict(state)
     state_for_write["output_dir"] = str(out)
-
-    # 必须先写入 output 再合并（否则 backend/frontend 只有空目录、无文件）
     write_artifacts(out, state_for_write)
 
     # 若指定存量路径，复制分析快照（只读引用，不改原文件）
@@ -1117,39 +1036,56 @@ def node_deliver(state: DevState) -> dict:
     merge_result: dict = {"ok": False, "skipped": True, "reason": "merge_disabled"}
     if state.get("merge_enabled"):
         target = cfg.resolve_merge_target(state.get("merge_target", ""))
+        merge_mode = state.get("merge_conflict_mode") or None
         merge_result = merge_to_project(
             out,
             target,
             backend_subdir=state.get("merge_backend_subdir") or cfg.MERGE_BACKEND_SUBDIR,
             frontend_subdir=state.get("merge_frontend_subdir") or cfg.MERGE_FRONTEND_SUBDIR,
+            conflict_mode=merge_mode,
         )
+        mode = merge_result.get("conflict_mode", "")
         if merge_result.get("needs_manual_resolution"):
             updates["logs"] = updates.get("logs", []) + [
-                f"[Deliver] 合并发现 {len(merge_result.get('conflicts', []))} 处冲突，"
-                f"已导出至 .merge_conflicts，请人工处理后写回主项目"
+                f"[Deliver] 合并模式={mode}：{len(merge_result.get('conflicts', []))} 个已存在文件"
+                f"未覆盖，见 .merge_conflicts（新文件已合并）"
             ]
             if merge_result.get("conflicts_report"):
                 updates["logs"].append(f"[Deliver] 冲突清单: {merge_result['conflicts_report']}")
-        if merge_result.get("ok"):
+        if merge_result.get("backend_files") or merge_result.get("frontend_files"):
             updates["logs"] = updates.get("logs", []) + [
                 f"[Deliver] 已合并到主项目: {target} "
                 f"(backend {len(merge_result['backend_files'])} 个, "
-                f"frontend {len(merge_result['frontend_files'])} 个)"
+                f"frontend {len(merge_result['frontend_files'])} 个, mode={mode})"
             ]
+            ow = merge_result.get("overwritten") or []
+            if ow:
+                updates["logs"].append(f"[Deliver] 已覆盖 {len(ow)} 个已存在文件")
         if not merge_result.get("ok"):
             updates["logs"] = updates.get("logs", []) + [
-                f"[Deliver] 合并跳过或失败: {merge_result.get('error', 'unknown')}"
+                f"[Deliver] 合并异常: {merge_result.get('error', 'unknown')}"
             ]
             logger.warning("合并失败: %s", merge_result)
     else:
-        updates["logs"] = updates.get("logs", []) + [
-            "[Deliver] 未合并: 已关闭 merge_enabled（可在 .env 或 Streamlit 侧边栏开启）"
-        ]
+        updates["logs"] = updates.get("logs", []) + ["[Deliver] 未启用合并到主项目"]
 
-    # 更新报告（含合并结果）
-    state_for_write["delivered"] = True
     state_for_write["merge_result"] = merge_result
-    write_artifacts(out, state_for_write)
+    (out / "reports" / "summary.json").write_text(
+        json.dumps(
+            {
+                "requirement": state.get("requirement"),
+                "review": state.get("review_result"),
+                "test": state.get("test_result"),
+                "defects": state.get("defects"),
+                "delivered": True,
+                "merge": merge_result,
+                "output_dir": str(out),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
     deliver_payload = {"path": str(out), "merge": merge_result}
     updates.update(
@@ -1168,8 +1104,12 @@ def node_deliver(state: DevState) -> dict:
 # 4. 路由与并行扇出
 # ═══════════════════════════════════════════════════════════════════════
 def route_parallel_dev(state: DevState) -> list[Send]:
-    """Supervisor 之后按 dev_scope 选择性启动开发 Agent（可仅前端或仅后端）。"""
-    scope = state.get("dev_scope") or "fullstack"
+    """按 dev_scope 只启动需要的开发 Agent。"""
+    scope = state.get("dev_scope") or _resolve_dev_scope(
+        state.get("requirement", ""),
+        state.get("tasks") or [],
+        {},
+    )
     sends: list[Send] = []
     if scope in ("fullstack", "backend_only"):
         sends.append(Send("backend_dev", state))
@@ -1237,14 +1177,7 @@ def build_pipeline():
     graph.add_node("supervisor", _with_retry(node_supervisor))
     graph.add_node("backend_dev", _with_retry(node_backend_dev))
     graph.add_node("frontend_dev", _with_retry(node_frontend_dev))
-    graph.add_node(
-        "join",
-        lambda s: _log(
-            s,
-            "Join",
-            f"开发完成(scope={s.get('dev_scope', 'fullstack')})，汇合进入评审",
-        ),
-    )
+    graph.add_node("join", lambda s: _log(s, "Join", "并行开发完成，汇合进入评审"))
     graph.add_node("code_review", _with_retry(node_code_review))
     graph.add_node("test", _with_retry(node_test))
     graph.add_node("fix_loop", fix_sub)  # 子图嵌套
@@ -1284,9 +1217,11 @@ def _build_initial_state(
     merge_enabled: bool | None = None,
     merge_backend_subdir: str = "",
     merge_frontend_subdir: str = "",
+    merge_conflict_mode: str = "",
 ) -> DevState:
     """构建流水线初始状态（含可配置合并目录）。"""
     enabled = cfg.MERGE_ENABLED if merge_enabled is None else merge_enabled
+    mode = (merge_conflict_mode or "").strip().lower()
     return {
         "requirement": requirement.strip(),
         "legacy_path": legacy_path.strip(),
@@ -1295,9 +1230,10 @@ def _build_initial_state(
         "merge_enabled": enabled,
         "merge_backend_subdir": (merge_backend_subdir or cfg.MERGE_BACKEND_SUBDIR).strip(),
         "merge_frontend_subdir": (merge_frontend_subdir or cfg.MERGE_FRONTEND_SUBDIR).strip(),
+        "merge_conflict_mode": mode,
         "merge_result": {},
+        "dev_scope": "",
         "tasks": [],
-        "dev_scope": "fullstack",
         "backend_files": {},
         "frontend_files": {},
         "defects": [],
@@ -1318,6 +1254,7 @@ def run_pipeline(
     merge_enabled: bool | None = None,
     merge_backend_subdir: str = "",
     merge_frontend_subdir: str = "",
+    merge_conflict_mode: str = "",
 ) -> DevState:
     """对外统一入口，供 CLI / Streamlit 调用。"""
     initial = _build_initial_state(
@@ -1328,6 +1265,7 @@ def run_pipeline(
         merge_enabled,
         merge_backend_subdir,
         merge_frontend_subdir,
+        merge_conflict_mode,
     )
     logger.info("========== 流水线启动 ==========")
     logger.info("需求: %s", requirement[:120])
@@ -1336,16 +1274,13 @@ def run_pipeline(
     if initial.get("merge_enabled"):
         logger.info("合并目标: %s", initial.get("merge_target"))
 
-    graph_cfg = graph_run_config(initial)
     try:
-        final = PIPELINE.invoke(initial, config=graph_cfg)
+        final = PIPELINE.invoke(initial)
     except Exception:
         logger.error("流水线异常:\n%s", traceback.format_exc())
         initial["errors"] = [traceback.format_exc()]
-        log_pipeline_run(initial)
         return initial
 
-    log_pipeline_run(final, run_id=str(final.get("output_dir", "")))
     logger.info("========== 流水线结束 delivered=%s ==========", final.get("delivered"))
     return final
 
@@ -1358,6 +1293,7 @@ def run_pipeline_stream(
     merge_enabled: bool | None = None,
     merge_backend_subdir: str = "",
     merge_frontend_subdir: str = "",
+    merge_conflict_mode: str = "",
 ):
     """
     流式执行流水线，逐步 yield 进度事件（供 Streamlit 实时展示）。
@@ -1371,6 +1307,7 @@ def run_pipeline_stream(
         merge_enabled,
         merge_backend_subdir,
         merge_frontend_subdir,
+        merge_conflict_mode,
     )
     yield {"type": "start", "message": "流水线启动"}
     logger.info("========== 流水线流式启动 ==========")
@@ -1378,9 +1315,8 @@ def run_pipeline_stream(
     last_log_len = 0
     final_state: DevState = initial
 
-    graph_cfg = graph_run_config(initial)
     try:
-        for state in PIPELINE.stream(initial, stream_mode="values", config=graph_cfg):
+        for state in PIPELINE.stream(initial, stream_mode="values"):
             final_state = state
             logs = state.get("logs") or []
             new_logs = logs[last_log_len:]
@@ -1395,11 +1331,9 @@ def run_pipeline_stream(
                 "state": state,
             }
         yield {"type": "done", "state": final_state}
-        log_pipeline_run(final_state, run_id=str(final_state.get("output_dir", "")))
     except Exception as e:
         logger.error("流水线流式异常:\n%s", traceback.format_exc())
         initial["errors"] = [traceback.format_exc()]
-        log_pipeline_run(initial)
         yield {"type": "error", "message": str(e), "state": initial}
 
     logger.info("========== 流水线流式结束 ==========")
@@ -1437,34 +1371,31 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output-dir", default="", help="输出目录（可选）")
     parser.add_argument("-m", "--merge-target", default="", help="合并到主项目根目录")
     parser.add_argument(
-        "--merge-run",
-        default="",
-        help="仅合并：指定 output/run_xxx 目录路径，不跑流水线",
-    )
-    parser.add_argument(
-        "--merge-mode",
-        default="",
-        choices=["manual", "overwrite", "skip", "backup"],
-        help="冲突策略: manual 人工 | overwrite 覆盖 | skip 跳过 | backup 备份",
-    )
-    parser.add_argument(
         "--no-merge",
         action="store_true",
         help="交付时不合并到主项目",
     )
+    parser.add_argument(
+        "--merge-run",
+        default="",
+        help="将已有 output/run_xxx 目录合并到主项目后退出",
+    )
+    parser.add_argument(
+        "--merge-mode",
+        default="",
+        choices=["", "overwrite", "manual", "skip", "backup"],
+        help="合并冲突策略（默认: MERGE_OVERWRITE=true 时为 overwrite）",
+    )
     args = parser.parse_args()
 
     if args.merge_run:
-        mr = merge_from_run(
-            args.merge_run,
-            merge_target=args.merge_target,
-            conflict_mode=args.merge_mode or None,
-        )
-        print(json.dumps(mr, ensure_ascii=False, indent=2))
-        raise SystemExit(0 if mr.get("ok") else 1)
+        mode = args.merge_mode or None
+        m = merge_from_run(args.merge_run, merge_target=args.merge_target, conflict_mode=mode)
+        print(json.dumps(m, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if m.get("ok") and not m.get("needs_manual_resolution") else 1)
 
     if not args.requirement.strip():
-        parser.error("请提供 -r 业务需求，或使用 --merge-run 仅执行合并")
+        parser.error("请提供 -r/--requirement，或使用 --merge-run 仅做合并")
 
     result = run_pipeline(
         args.requirement,
@@ -1472,6 +1403,7 @@ if __name__ == "__main__":
         args.output_dir,
         merge_target=args.merge_target,
         merge_enabled=False if args.no_merge else None,
+        merge_conflict_mode=args.merge_mode,
     )
     print("\n--- 执行日志 ---")
     for line in result.get("logs", []):
@@ -1479,9 +1411,3 @@ if __name__ == "__main__":
     print("\n--- 交付 ---")
     print("delivered:", result.get("delivered"))
     print("output:", result.get("output_dir"))
-    mr = result.get("merge_result") or {}
-    if mr.get("ok"):
-        print("merge: OK ->", mr.get("target_root"))
-        print("  backend:", len(mr.get("backend_files", [])), "frontend:", len(mr.get("frontend_files", [])))
-    elif not mr.get("skipped"):
-        print("merge failed:", mr.get("error"))
