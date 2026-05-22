@@ -1,36 +1,33 @@
 ---
 name: frontend-vue
-description: Vue 3 前端结构与编码规范
+description: Vue 3 前端结构与编码规范（按需求选用）
 ---
 
 # Vue 3 前端规范
 
-## 目录结构
+## 原则
+- **以用户原文需求为准**（纯 UI、绘图、单页、多页、对接 API 等均可）
+- 无 api_contract 时不要假设后端接口；可用本地状态或静态内容
+
+## 常见目录（按需创建）
 ```
 frontend/
 ├── src/
-│   ├── api/           # axios 或 fetch 封装
-│   ├── views/         # 页面 *.vue
+│   ├── api/           # 有契约时再封装请求
+│   ├── views/         # 多页面
+│   ├── components/    # 可复用组件
 │   ├── router/index.js
-│   └── App.vue
-└── package.json       # 可选
+│   └── App.vue        # 单页需求可只改此文件
 ```
 
 ## 组件规范
 - 使用 `<script setup>` + Composition API
-- 单文件组件: `views/LoginView.vue`
-- 表单字段与 api_contract body 字段名一致
+- 表单字段名与 api_contract 一致（有契约时）
+- 密码框使用 `type="password"`（有密码输入时）
 
-## 请求封装
-- `src/api/auth.js` 导出 `register()`、`login()`
+## 请求封装（有后端契约时）
+- `src/api/<module>.js` 导出与契约一致的函数
 - baseURL: `import.meta.env.VITE_API_BASE || 'http://localhost:8000'`
 
 ## 交互
-- 密码框: `type="password"`
-- 提交中禁用按钮，展示 loading
-- 捕获错误并 `alert` 或页面提示
-
-## 路由
-```js
-{ path: '/login', component: () => import('../views/LoginView.vue') }
-```
+- 异步提交时可用 loading 与错误提示

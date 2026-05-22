@@ -509,36 +509,90 @@ def _invoke_llm(
     except Exception as e:
         logger.error("LLM 调用失败: %s", e)
         if cfg.USE_MOCK_LLM:
-            logger.warning("Mock 模式已开启，回退本地模板")
+            logger.warning("Mock 模式已开启，回退 Mock 响应")
             return _mock_llm_response(system, user)
         raise
 
 
+def _requirement_from_prompt(user: str) -> str:
+    """从 user prompt 中提取「业务需求」正文（Mock / 重试共用）。"""
+    m = re.search(r"##\s*业务需求[^\n]*\n([\s\S]*?)(?:\n##\s|\Z)", user)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"用户原文需求[^：:]*[：:]\s*\n([\s\S]+)", user)
+    if m2:
+        return m2.group(1).strip()
+    return user.strip()[:500]
+
+
+def _mock_agent_role(system: str) -> str:
+    """按 system 首段角色句识别 Agent，避免 Skill 里出现 Supervisor 等词误判。"""
+    head = (system or "")[:800]
+    if "你是 Supervisor 调度 Agent" in head:
+        return "supervisor"
+    if "你是后端开发 Agent" in head:
+        return "backend"
+    if "你是前端开发 Agent" in head:
+        return "frontend"
+    if "你是代码评审 Agent" in head:
+        return "code_review"
+    if "你是测试 Agent" in head:
+        return "test"
+    if "你是缺陷修复 Agent" in head:
+        return "bug_fix"
+    return "unknown"
+
+
 def _mock_llm_response(system: str, user: str) -> str:
-    """无 API Key 时的可运行演示逻辑。"""
-    if "Supervisor" in system or "调度" in system:
+    """无 API Key 时的可运行演示逻辑（按需求原文生成占位产物，不写死业务类型）。"""
+    req = _requirement_from_prompt(user)
+    role = _mock_agent_role(system)
+    if role == "supervisor":
+        scope = _resolve_dev_scope(req, [], {})
+        tasks = _default_tasks_for_scope(scope, req)
         return json.dumps(
             {
-                "tasks": [
-                    {"id": "be-1", "role": "backend", "desc": "用户表与注册登录 API"},
-                    {"id": "fe-1", "role": "frontend", "desc": "登录页与注册表单"},
-                ],
-                "api_contract": {
-                    "POST /api/auth/register": {"body": ["username", "password", "email"]},
-                    "POST /api/auth/login": {"body": ["username", "password"]},
-                },
+                "scope": scope,
+                "dev_scope": scope,
+                "tasks": tasks,
+                "api_contract": {},
+                "notes": f"Mock 编排: {req[:80]}",
             },
             ensure_ascii=False,
         )
-    if "后端" in system:
-        return "MOCK_BACKEND_OK"
-    if "前端" in system or "Vue" in system:
-        return "MOCK_FRONTEND_OK"
-    if "评审" in system or "code_review" in system.lower():
+    if role == "backend":
+        safe = req.replace('"', "'")[:200]
+        return json.dumps(
+            {
+                "files": {
+                    "README.md": f"# Mock 后端占位\n\n按需求实现: {safe}\n",
+                }
+            },
+            ensure_ascii=False,
+        )
+    if role == "frontend":
+        safe = req.replace('"', "'")[:120]
+        return json.dumps(
+            {
+                "files": {
+                    "src/App.vue": (
+                        "<template><main class=\"page\"><h1>{{ title }}</h1>"
+                        "<p class=\"hint\">Mock 占位，请配置 API Key 后由模型按需求生成真实代码</p></main></template>\n"
+                        f"<script setup>\nconst title = \"{safe}\";\n</script>\n"
+                        "<style scoped>.page { padding: 2rem; }</style>\n"
+                    ),
+                }
+            },
+            ensure_ascii=False,
+        )
+    if role == "code_review":
         return json.dumps({"score": 82, "issues": [], "passed": True}, ensure_ascii=False)
-    if "测试" in system:
-        return json.dumps({"passed": True, "cases": 5, "failed": 0}, ensure_ascii=False)
-    if "修复" in system:
+    if role == "test":
+        return json.dumps(
+            {"passed": True, "cases_run": 0, "failed": 0, "defects": [], "summary": "mock"},
+            ensure_ascii=False,
+        )
+    if role == "bug_fix":
         return "MOCK_FIX_OK"
     return "MOCK_OK"
 
@@ -576,171 +630,43 @@ def _parse_files_from_llm(raw: str) -> dict[str, str]:
     return out
 
 
-def _template_backend_files() -> dict[str, str]:
-    """兜底模板（仅 LLM 解析失败时使用）。"""
-    return {
-        "models/user.py": textwrap.dedent(
-            '''
-            """用户模型"""
-            from dataclasses import dataclass
-            from datetime import datetime
-
-            @dataclass
-            class User:
-                id: int
-                username: str
-                email: str
-                password_hash: str
-                created_at: datetime
-            '''
-        ).strip()
-        + "\n",
-        "services/auth_service.py": textwrap.dedent(
-            '''
-            from typing import Optional
-
-            class AuthService:
-                def register(self, username: str, password: str, email: str) -> dict:
-                    return {"id": 1, "username": username, "email": email}
-
-                def login(self, username: str, password: str) -> Optional[dict]:
-                    if not username or not password:
-                        return None
-                    return {"token": "demo-token", "username": username}
-            '''
-        ).strip()
-        + "\n",
-        "api/routes.py": textwrap.dedent(
-            '''
-            from fastapi import APIRouter, HTTPException
-            from pydantic import BaseModel
-
-            router = APIRouter(prefix="/api/auth")
-
-            class RegisterBody(BaseModel):
-                username: str
-                password: str
-                email: str
-
-            class LoginBody(BaseModel):
-                username: str
-                password: str
-
-            @router.post("/register")
-            def register(body: RegisterBody):
-                return {"ok": True, "user": body.username}
-
-            @router.post("/login")
-            def login(body: LoginBody):
-                if len(body.password) < 6:
-                    raise HTTPException(400, "密码过短")
-                return {"token": "demo-token"}
-            '''
-        ).strip()
-        + "\n",
-        "schema.sql": textwrap.dedent(
-            '''
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username VARCHAR(64) UNIQUE NOT NULL,
-                email VARCHAR(128) UNIQUE NOT NULL,
-                password_hash VARCHAR(256) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            '''
-        ).strip()
-        + "\n",
-    }
+_STRICT_JSON_REMINDER = """
+【重要】必须严格按用户原文实现，禁止擅自改成登录/注册/笔记/待办/增删改查等其它业务。
+仅输出 JSON：{"files": {"相对路径": "完整文件内容"}}，不要 markdown 包裹。"""
 
 
-def _template_frontend_files() -> dict[str, str]:
-    """兜底模板（仅 LLM 解析失败时使用）。"""
-    return {
-        "src/api/auth.js": textwrap.dedent(
-            '''
-            const BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-
-            export async function register(data) {
-              const res = await fetch(`${BASE}/api/auth/register`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(data),
-              });
-              if (!res.ok) throw new Error("注册失败");
-              return res.json();
-            }
-
-            export async function login(data) {
-              const res = await fetch(`${BASE}/api/auth/login`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(data),
-              });
-              if (!res.ok) throw new Error("登录失败");
-              return res.json();
-            }
-            '''
-        ).strip()
-        + "\n",
-        "src/views/LoginView.vue": textwrap.dedent(
-            '''
-            <template>
-              <div class="login-page">
-                <h1>登录 / 注册</h1>
-                <input v-model="username" placeholder="用户名" />
-                <input v-model="password" type="password" placeholder="密码" />
-                <input v-model="email" placeholder="邮箱" />
-                <button :disabled="loading" @click="onLogin">登录</button>
-                <button :disabled="loading" @click="onRegister">注册</button>
-                <p>{{ msg }}</p>
-              </div>
-            </template>
-            <script setup>
-            import { ref } from "vue";
-            import { login, register } from "../api/auth.js";
-            const username = ref(""); const password = ref(""); const email = ref("");
-            const msg = ref(""); const loading = ref(false);
-            async function onLogin() {
-              loading.value = true;
-              try { const d = await login({ username: username.value, password: password.value });
-                msg.value = `登录成功: ${d.token}`; } catch (e) { msg.value = String(e); }
-              finally { loading.value = false; }
-            }
-            async function onRegister() {
-              loading.value = true;
-              try { await register({ username: username.value, password: password.value, email: email.value });
-                msg.value = "注册成功"; } catch (e) { msg.value = String(e); }
-              finally { loading.value = false; }
-            }
-            </script>
-            '''
-        ).strip()
-        + "\n",
-        "src/router/index.js": textwrap.dedent(
-            '''
-            import { createRouter, createWebHistory } from "vue-router";
-            export default createRouter({
-              history: createWebHistory(),
-              routes: [
-                { path: "/", redirect: "/login" },
-                { path: "/login", component: () => import("../views/LoginView.vue") },
-              ],
-            });
-            '''
-        ).strip()
-        + "\n",
-        "src/App.vue": "<template><router-view /></template>\n<script setup></script>\n",
-    }
-
-
-def _resolve_dev_files(raw: str, fallback: dict[str, str], agent: str) -> tuple[dict[str, str], str]:
-    """解析 LLM 产出；失败则用模板兜底。返回 (files, source)。source: llm | template"""
+def _dev_llm_generate(
+    agent: str,
+    system: str,
+    user: str,
+    requirement: str,
+) -> tuple[dict[str, str], str, str]:
+    """
+    调用 LLM 生成代码文件；解析失败则带需求原文重试一次。
+    返回 (files, code_source, raw_last)。
+    code_source: llm | failed
+    不使用任何写死的业务模板兜底。
+    """
+    raw = _invoke_llm(system, user, agent=agent, requirement=requirement[:200])
     parsed = _parse_files_from_llm(raw)
-    if len(parsed) >= 1:
-        logger.info("%s 使用 LLM 生成代码，共 %d 个文件", agent, len(parsed))
-        return parsed, "llm"
-    logger.warning("%s LLM 未解析出 files，使用模板兜底", agent)
-    return dict(fallback), "template"
+    if parsed:
+        logger.info("%s LLM 生成 %d 个文件", agent, len(parsed))
+        return parsed, "llm", raw
+
+    retry_user = (
+        user
+        + "\n\n"
+        + _STRICT_JSON_REMINDER
+        + f"\n用户原文需求（必须逐字落实）：\n{requirement}"
+    )
+    logger.warning("%s 首次未解析出 files，带需求原文重试", agent)
+    raw2 = _invoke_llm(system, retry_user, agent=agent, requirement=requirement[:200])
+    parsed2 = _parse_files_from_llm(raw2)
+    if parsed2:
+        return parsed2, "llm", raw2
+
+    logger.error("%s 两次均未解析出有效 files JSON，不写入模板代码", agent)
+    return {}, "failed", raw2 or raw
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -823,14 +749,15 @@ def _resolve_dev_scope(requirement: str, tasks: list[dict], data: dict) -> str:
     return "fullstack"
 
 
-def _default_tasks_for_scope(scope: str) -> list[dict]:
+def _default_tasks_for_scope(scope: str, requirement: str = "") -> list[dict]:
+    desc = (requirement or "按用户描述实现").strip()[:200]
     if scope == "frontend_only":
-        return [{"id": "fe-1", "role": "frontend", "desc": "前端页面与交互"}]
+        return [{"id": "fe-1", "role": "frontend", "desc": desc}]
     if scope == "backend_only":
-        return [{"id": "be-1", "role": "backend", "desc": "后端 API 与服务"}]
+        return [{"id": "be-1", "role": "backend", "desc": desc}]
     return [
-        {"id": "be-1", "role": "backend", "desc": "核心业务 API"},
-        {"id": "fe-1", "role": "frontend", "desc": "业务页面与交互"},
+        {"id": "be-1", "role": "backend", "desc": desc},
+        {"id": "fe-1", "role": "frontend", "desc": desc},
     ]
 
 
@@ -860,21 +787,21 @@ def node_supervisor(state: DevState) -> dict:
     tasks = data.get("tasks") or []
     dev_scope = _resolve_dev_scope(req, tasks, data)
     if not tasks:
-        tasks = _default_tasks_for_scope(dev_scope)
+        tasks = _default_tasks_for_scope(dev_scope, req)
     else:
         # 按 scope 过滤与需求不符的子任务
         if dev_scope == "frontend_only":
             tasks = [t for t in tasks if (t.get("role") or "").lower() in ("frontend", "fe", "前端")]
             if not tasks:
-                tasks = _default_tasks_for_scope("frontend_only")
+                tasks = _default_tasks_for_scope("frontend_only", req)
         elif dev_scope == "backend_only":
             tasks = [t for t in tasks if (t.get("role") or "").lower() in ("backend", "be", "后端")]
             if not tasks:
-                tasks = _default_tasks_for_scope("backend_only")
+                tasks = _default_tasks_for_scope("backend_only", req)
 
-    contract = data.get("api_contract") or {}
-    if dev_scope == "frontend_only" and not contract:
-        contract = {"notes": "仅前端，可无后端接口或使用 mock 数据"}
+    contract = data.get("api_contract")
+    if contract is None:
+        contract = {} if dev_scope != "fullstack" else {}
 
     payload = {
         "tasks": tasks,
@@ -910,8 +837,7 @@ def node_backend_dev(state: DevState) -> dict:
         api_contract=json.dumps(contract, ensure_ascii=False),
         stack_hint=legacy.get("stack_hint", "python"),
     )
-    raw = _invoke_llm(system, user, agent="BackendDev")
-    files, code_source = _resolve_dev_files(raw, _template_backend_files(), "BackendDev")
+    files, code_source, _ = _dev_llm_generate("BackendDev", system, user, req)
 
     updates.update(
         {
@@ -923,9 +849,9 @@ def node_backend_dev(state: DevState) -> dict:
             ),
         }
     )
-    if code_source == "template":
+    if code_source == "failed":
         updates["logs"] = updates.get("logs", []) + [
-            "[BackendDev] 提示: LLM 输出未解析为 files JSON，已用兜底模板"
+            "[BackendDev] 未生成代码：模型未返回可解析的 files JSON，请查看 LangSmith/终端或简化需求"
         ]
     logger.info("BackendDev 产出 %d 个文件", len(files))
     return updates
@@ -941,10 +867,9 @@ def node_frontend_dev(state: DevState) -> dict:
     user = build_user(
         "frontend",
         api_contract=json.dumps(contract, ensure_ascii=False),
-        requirement=req[:500],
+        requirement=req,
     )
-    raw = _invoke_llm(system, user, agent="FrontendDev")
-    files, code_source = _resolve_dev_files(raw, _template_frontend_files(), "FrontendDev")
+    files, code_source, _ = _dev_llm_generate("FrontendDev", system, user, req)
 
     updates.update(
         {
@@ -956,9 +881,9 @@ def node_frontend_dev(state: DevState) -> dict:
             ),
         }
     )
-    if code_source == "template":
+    if code_source == "failed":
         updates["logs"] = updates.get("logs", []) + [
-            "[FrontendDev] 提示: LLM 输出未解析为 files JSON，已用兜底模板"
+            "[FrontendDev] 未生成代码：模型未返回可解析的 files JSON，请查看 LangSmith/终端或简化需求"
         ]
     logger.info("FrontendDev 产出 %d 个文件", len(files))
     return updates
@@ -975,42 +900,20 @@ def node_code_review(state: DevState) -> dict:
     score = 100
     scope = state.get("dev_scope") or "fullstack"
 
-    # 规则化静态检查（按 dev_scope 只检查本次应交付的部分）
-    if scope != "frontend_only":
-        if "schema.sql" not in backend:
-            issues.append({"severity": "medium", "msg": "缺少数据库 schema 文件"})
-            score -= 10
-        if "api/routes.py" not in backend:
-            issues.append({"severity": "high", "msg": "缺少 API 路由"})
-            score -= 20
-    if scope != "backend_only":
-        fe_api = any(p.startswith("src/api/") for p in frontend)
-        if not fe_api and scope == "frontend_only":
-            issues.append({"severity": "medium", "msg": "缺少前端 API 客户端 (src/api/)"})
-            score -= 10
-        elif not fe_api:
-            issues.append({"severity": "high", "msg": "缺少前端 API 客户端 (src/api/)"})
-            score -= 20
-        if not any(p.endswith(".vue") for p in frontend):
-            issues.append({"severity": "medium", "msg": "缺少 Vue 页面组件 (src/views/*.vue)"})
-            score -= 10
+    # 规则化静态检查：只验证「本次 scope 是否有交付」，不按固定业务类型要求文件结构
+    if scope in ("fullstack", "backend_only") and not backend:
+        issues.append({"severity": "high", "msg": "未生成任何后端文件"})
+        score -= 40
+    if scope in ("fullstack", "frontend_only") and not frontend:
+        issues.append({"severity": "high", "msg": "未生成任何前端文件"})
+        score -= 40
 
     be_text = "\n".join(backend.values())
-    if "password" in be_text and "hash" not in be_text.lower():
+    if be_text and "password" in be_text.lower() and "hash" not in be_text.lower():
         issues.append({"severity": "high", "msg": "后端可能存在明文密码风险"})
         score -= 15
 
-    fe_text = "\n".join(frontend.values())
-    for ep in ["/register", "/login"]:
-        if ep not in fe_text:
-            issues.append({"severity": "medium", "msg": f"前端未覆盖端点 {ep}"})
-            score -= 5
-
-    # 契约一致性
     contract_str = json.dumps(contract, ensure_ascii=False)
-    if "/api/auth" not in contract_str and "/api/" not in contract_str:
-        issues.append({"severity": "low", "msg": "API 契约较简略"})
-        score -= 5
 
     static_score = max(0, min(100, score))
 
@@ -1081,34 +984,7 @@ def node_test(state: DevState) -> dict:
     backend = state.get("backend_files") or {}
     frontend = state.get("frontend_files") or {}
 
-    test_files = {
-        "test_auth_service.py": textwrap.dedent(
-            '''
-            import pytest
-
-            def test_login_requires_password():
-                from services.auth_service import AuthService
-                svc = AuthService()
-                assert svc.login("alice", "") is None
-
-            def test_register_returns_user():
-                from services.auth_service import AuthService
-                svc = AuthService()
-                r = svc.register("alice", "secret123", "a@b.com")
-                assert r["username"] == "alice"
-            '''
-        ).strip()
-        + "\n",
-        "test_api_contract.py": textwrap.dedent(
-            '''
-            def test_routes_define_login():
-                content = open("api/routes.py", encoding="utf-8").read()
-                assert "/login" in content
-                assert "HTTPException" in content
-            '''
-        ).strip()
-        + "\n",
-    }
+    test_files: dict[str, str] = {}
 
     system = build_system("test")
     user = build_user(
@@ -1121,21 +997,23 @@ def node_test(state: DevState) -> dict:
 
     defects: list[dict] = []
     scope = state.get("dev_scope") or "fullstack"
-    if scope != "frontend_only" and "HTTPException" not in backend.get("api/routes.py", ""):
-        defects.append({"id": "D-001", "module": "backend", "desc": "路由缺少异常处理"})
-    login_vue = frontend.get("src/views/LoginView.vue", "")
-    if login_vue and 'type="password"' not in login_vue:
-        defects.append({"id": "D-002", "module": "frontend", "desc": "Vue 密码框未设置 type=password"})
-
-    # 修复轮次后模拟复测通过
-    fix_round = state.get("fix_round") or 0
-    if fix_round > 0:
-        defects = [d for d in defects if d["id"] != "D-002"]
+    routes_py = backend.get("api/routes.py", "")
+    if scope != "frontend_only" and routes_py and "HTTPException" not in routes_py:
+        defects.append({"id": "D-001", "module": "backend", "desc": "api/routes.py 建议补充 HTTPException"})
+    for path, content in frontend.items():
+        if path.endswith(".vue") and "password" in content.lower() and 'type="password"' not in content:
+            defects.append(
+                {
+                    "id": f"D-fe-{path}",
+                    "module": "frontend",
+                    "desc": f"{path} 中密码输入建议设置 type=password",
+                }
+            )
 
     passed = len(defects) == 0
     result = {
         "passed": passed,
-        "cases_run": 4,
+        "cases_run": 0 if not test_files else len(test_files),
         "failed": len(defects),
         "defects": defects,
         "test_files": list(test_files.keys()),
@@ -1186,13 +1064,14 @@ def node_bug_fix(state: DevState) -> dict:
         logger.info("BugFix 通过 LLM 更新 %d 个文件", len(patched))
     else:
         for d in defects:
-            if d.get("module") == "frontend" and "password" in d.get("desc", ""):
-                path = "src/views/LoginView.vue"
-                if path in frontend and 'type="password"' not in frontend[path]:
-                    frontend[path] = frontend[path].replace(
-                        'v-model="password" placeholder="密码"',
-                        'v-model="password" type="password" placeholder="密码"',
-                    )
+            if d.get("module") == "frontend" and "password" in d.get("desc", "").lower():
+                for path, content in list(frontend.items()):
+                    if path.endswith(".vue") and "password" in content.lower() and 'type="password"' not in content:
+                        frontend[path] = content.replace(
+                            'v-model="password"',
+                            'v-model="password" type="password"',
+                            1,
+                        )
             if d.get("module") == "backend":
                 path = "api/routes.py"
                 if path in backend and "HTTPException" not in backend[path]:

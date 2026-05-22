@@ -60,7 +60,7 @@ def render_agent_cards(outputs: dict):
         with cols[i % 2]:
             with st.expander(f"{icon} **{name}** — {desc}", expanded=(name in ("Supervisor", "Deliver"))):
                 if isinstance(data, dict) and data.get("code_source"):
-                    st.caption(f"代码来源: **{data['code_source']}**（llm=模型生成 / template=兜底模板）")
+                    st.caption(f"代码来源: **{data['code_source']}**（llm=模型生成 / failed=未解析出有效 JSON）")
                 st.json(data)
 
 
@@ -164,8 +164,8 @@ st.divider()
 requirement = st.text_area(
     "业务需求",
     height=140,
-    placeholder="例如：实现用户注册登录功能，包含前后端与数据库表，需通过评审和自动化测试…",
-    value="实现用户注册与登录功能，包含 SQLite 用户表、Python FastAPI 后端接口、Vue 3 登录页，并通过代码评审与自动化测试。",
+    placeholder="用自然语言描述任意需求，例如：画一个圆、做一个计数器、只写前端展示页、实现某某 API…",
+    value="",
 )
 
 col_run, col_clear = st.columns([1, 4])
