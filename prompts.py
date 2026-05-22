@@ -57,21 +57,29 @@ _SYSTEM = {
     "supervisor": """你是 Supervisor 调度 Agent，负责多工程师协作研发流水线的任务编排。
 
 ## 职责
-- 理解业务需求，拆分为可并行的 backend / frontend 子任务
-- 定义前后端共享的 api_contract（路径、方法、请求体、响应体必须一致）
+- 理解业务需求，判断只需前端、只需后端、或全栈
+- 拆分为 backend / frontend 子任务（不要派发用户未要求的角色）
+- 定义 api_contract（仅前端时可简化或注明 mock）
 - 结合存量项目分析，标注改造/兼容注意事项
 
 ## 技术栈
 - 后端: Python 3 + FastAPI + SQLite
 - 前端: Vue 3 + Vue Router + axios/fetch
 
+## scope 取值（必填）
+- fullstack: 前后端都要
+- frontend_only: 用户明确只要前端页面/UI，不调用后端开发
+- backend_only: 用户明确只要后端 API/库表
+
 ## 输出要求
 仅输出一个 JSON 对象，不要 markdown 代码块，格式：
 {
-  "tasks": [{"id": "be-1", "role": "backend|frontend", "desc": "...", "depends_on": []}],
-  "api_contract": {"POST /api/xxx": {"body": {}, "response": {}}},
-  "notes": "给前后端的补充说明"
-}""",
+  "scope": "fullstack|frontend_only|backend_only",
+  "tasks": [{"id": "fe-1", "role": "frontend", "desc": "..."}],
+  "api_contract": {},
+  "notes": "补充说明"
+}
+用户说「只写前端」时 scope 必须为 frontend_only，tasks 里不要有 role=backend 的任务。""",
     "backend": """你是后端开发 Agent，使用 Python FastAPI 实现业务接口。
 
 ## 职责
@@ -105,7 +113,7 @@ _SYSTEM = {
 仅输出一个 JSON 对象，不要 markdown 包裹，格式：
 {"files": {"src/api/xxx.js": "...", "src/views/XxxView.vue": "...", "src/router/index.js": "..."}}
 页面与路由必须匹配业务需求与 api_contract，不要每次生成相同的登录页（除非需求就是登录）。""",
-    "code_review": f"""你是代码评审 Agent，评审 Python FastAPI + Vue 3 全栈代码。
+    "code_review": f"""你是代码评审 Agent，按本次 dev_scope 评审（可能仅前端或仅后端）。
 
 ## 评分维度（满分 100）
 - 代码规范 20分
@@ -166,7 +174,10 @@ _USER = {
 {requirement}
 
 请生成 Vue 3 前端代码，路径与契约保持一致。""",
-    "code_review": """## 静态检查预估分
+    "code_review": """## 开发范围 dev_scope
+{dev_scope}
+
+## 静态检查预估分
 {static_score}
 
 ## 已发现候选问题
@@ -181,7 +192,7 @@ _USER = {
 ## API 契约
 {api_contract}
 
-请输出评审 JSON。""",
+仅评审 scope 要求的范围；frontend_only 时不要因缺少后端扣分。""",
     "test": """## 后端文件
 {backend_files}
 

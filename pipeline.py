@@ -72,6 +72,7 @@ class DevState(TypedDict, total=False):
     # Supervisor 产出
     tasks: list[dict]
     api_contract: dict
+    dev_scope: str  # fullstack | frontend_only | backend_only
 
     # 并行开发生产物
     backend_files: Annotated[dict[str, str], _merge_dicts]
@@ -767,6 +768,72 @@ def _with_retry(fn, attempts: int | None = None):
     return wrapped
 
 
+def _resolve_dev_scope(requirement: str, tasks: list[dict], data: dict) -> str:
+    """
+    决定本次跑哪些开发 Agent。
+    优先: Supervisor 输出的 scope → 需求关键词 → tasks 里的 role。
+    """
+    scope_raw = (data.get("scope") or data.get("dev_scope") or "").strip().lower()
+    if scope_raw in ("frontend_only", "frontend", "fe_only", "fe"):
+        return "frontend_only"
+    if scope_raw in ("backend_only", "backend", "be_only", "be"):
+        return "backend_only"
+    if scope_raw in ("fullstack", "full", "both"):
+        return "fullstack"
+
+    req = requirement.lower()
+    fe_only = (
+        "只写前端",
+        "仅前端",
+        "只要前端",
+        "只做前端",
+        "只开发前端",
+        "仅开发前端",
+        "前端页面即可",
+        "不写后端",
+        "不要后端",
+        "无需后端",
+        "only frontend",
+        "frontend only",
+    )
+    be_only = (
+        "只写后端",
+        "仅后端",
+        "只要后端",
+        "只做后端",
+        "只开发后端",
+        "不写前端",
+        "不要前端",
+        "无需前端",
+        "only backend",
+        "backend only",
+    )
+    if any(k in req for k in fe_only):
+        return "frontend_only"
+    if any(k in req for k in be_only):
+        return "backend_only"
+
+    roles = {(t.get("role") or "").lower() for t in tasks}
+    has_be = any(r in ("backend", "be", "后端") for r in roles)
+    has_fe = any(r in ("frontend", "fe", "前端") for r in roles)
+    if has_fe and not has_be:
+        return "frontend_only"
+    if has_be and not has_fe:
+        return "backend_only"
+    return "fullstack"
+
+
+def _default_tasks_for_scope(scope: str) -> list[dict]:
+    if scope == "frontend_only":
+        return [{"id": "fe-1", "role": "frontend", "desc": "前端页面与交互"}]
+    if scope == "backend_only":
+        return [{"id": "be-1", "role": "backend", "desc": "后端 API 与服务"}]
+    return [
+        {"id": "be-1", "role": "backend", "desc": "核心业务 API"},
+        {"id": "fe-1", "role": "frontend", "desc": "业务页面与交互"},
+    ]
+
+
 def node_supervisor(state: DevState) -> dict:
     """Supervisor: 任务拆分、API 契约、流程管控。"""
     updates = _log(state, "Supervisor", "开始任务拆分与流程编排")
@@ -790,23 +857,42 @@ def node_supervisor(state: DevState) -> dict:
     raw = _invoke_llm(system, user, agent="Supervisor")
     data = _parse_json_from_llm(raw)
 
-    tasks = data.get("tasks") or [
-        {"id": "be-1", "role": "backend", "desc": "核心业务 API"},
-        {"id": "fe-1", "role": "frontend", "desc": "业务页面与交互"},
-    ]
-    contract = data.get("api_contract") or {
-        "GET /api/health": {"response": {"status": "ok"}},
-    }
+    tasks = data.get("tasks") or []
+    dev_scope = _resolve_dev_scope(req, tasks, data)
+    if not tasks:
+        tasks = _default_tasks_for_scope(dev_scope)
+    else:
+        # 按 scope 过滤与需求不符的子任务
+        if dev_scope == "frontend_only":
+            tasks = [t for t in tasks if (t.get("role") or "").lower() in ("frontend", "fe", "前端")]
+            if not tasks:
+                tasks = _default_tasks_for_scope("frontend_only")
+        elif dev_scope == "backend_only":
+            tasks = [t for t in tasks if (t.get("role") or "").lower() in ("backend", "be", "后端")]
+            if not tasks:
+                tasks = _default_tasks_for_scope("backend_only")
 
-    payload = {"tasks": tasks, "api_contract": contract}
+    contract = data.get("api_contract") or {}
+    if dev_scope == "frontend_only" and not contract:
+        contract = {"notes": "仅前端，可无后端接口或使用 mock 数据"}
+
+    payload = {
+        "tasks": tasks,
+        "api_contract": contract,
+        "dev_scope": dev_scope,
+        "scope": dev_scope,
+    }
     updates.update(
         {
             "tasks": tasks,
             "api_contract": contract,
+            "dev_scope": dev_scope,
             **_save_agent_output(state, "Supervisor", payload),
+            "logs": updates.get("logs", [])
+            + [f"[Supervisor] 开发范围 dev_scope={dev_scope}，子任务 {len(tasks)} 个"],
         }
     )
-    logger.info("Supervisor 拆分 %d 个子任务", len(tasks))
+    logger.info("Supervisor scope=%s tasks=%d", dev_scope, len(tasks))
     return updates
 
 
@@ -887,21 +973,27 @@ def node_code_review(state: DevState) -> dict:
 
     issues: list[dict] = []
     score = 100
+    scope = state.get("dev_scope") or "fullstack"
 
-    # 规则化静态检查（可扩展）
-    if "schema.sql" not in backend:
-        issues.append({"severity": "medium", "msg": "缺少数据库 schema 文件"})
-        score -= 10
-    if "api/routes.py" not in backend:
-        issues.append({"severity": "high", "msg": "缺少 API 路由"})
-        score -= 20
-    fe_api = any(p.startswith("src/api/") for p in frontend)
-    if not fe_api:
-        issues.append({"severity": "high", "msg": "缺少前端 API 客户端 (src/api/)"})
-        score -= 20
-    if not any(p.endswith(".vue") for p in frontend):
-        issues.append({"severity": "medium", "msg": "缺少 Vue 页面组件 (src/views/*.vue)"})
-        score -= 10
+    # 规则化静态检查（按 dev_scope 只检查本次应交付的部分）
+    if scope != "frontend_only":
+        if "schema.sql" not in backend:
+            issues.append({"severity": "medium", "msg": "缺少数据库 schema 文件"})
+            score -= 10
+        if "api/routes.py" not in backend:
+            issues.append({"severity": "high", "msg": "缺少 API 路由"})
+            score -= 20
+    if scope != "backend_only":
+        fe_api = any(p.startswith("src/api/") for p in frontend)
+        if not fe_api and scope == "frontend_only":
+            issues.append({"severity": "medium", "msg": "缺少前端 API 客户端 (src/api/)"})
+            score -= 10
+        elif not fe_api:
+            issues.append({"severity": "high", "msg": "缺少前端 API 客户端 (src/api/)"})
+            score -= 20
+        if not any(p.endswith(".vue") for p in frontend):
+            issues.append({"severity": "medium", "msg": "缺少 Vue 页面组件 (src/views/*.vue)"})
+            score -= 10
 
     be_text = "\n".join(backend.values())
     if "password" in be_text and "hash" not in be_text.lower():
@@ -925,6 +1017,7 @@ def node_code_review(state: DevState) -> dict:
     system = build_system("code_review")
     user = build_user(
         "code_review",
+        dev_scope=scope,
         static_score=static_score,
         issues=json.dumps(issues, ensure_ascii=False),
         backend_files=list(backend.keys()),
@@ -1027,7 +1120,8 @@ def node_test(state: DevState) -> dict:
     _invoke_llm(system, user, agent="TestAgent")
 
     defects: list[dict] = []
-    if "HTTPException" not in backend.get("api/routes.py", ""):
+    scope = state.get("dev_scope") or "fullstack"
+    if scope != "frontend_only" and "HTTPException" not in backend.get("api/routes.py", ""):
         defects.append({"id": "D-001", "module": "backend", "desc": "路由缺少异常处理"})
     login_vue = frontend.get("src/views/LoginView.vue", "")
     if login_vue and 'type="password"' not in login_vue:
@@ -1195,12 +1289,18 @@ def node_deliver(state: DevState) -> dict:
 # 4. 路由与并行扇出
 # ═══════════════════════════════════════════════════════════════════════
 def route_parallel_dev(state: DevState) -> list[Send]:
-    """Supervisor 之后并行分派前后端 Agent（LangGraph Send 并行）。"""
-    logger.info("路由: 并行启动 BackendDev + FrontendDev")
-    return [
-        Send("backend_dev", state),
-        Send("frontend_dev", state),
-    ]
+    """Supervisor 之后按 dev_scope 选择性启动开发 Agent（可仅前端或仅后端）。"""
+    scope = state.get("dev_scope") or "fullstack"
+    sends: list[Send] = []
+    if scope in ("fullstack", "backend_only"):
+        sends.append(Send("backend_dev", state))
+    if scope in ("fullstack", "frontend_only"):
+        sends.append(Send("frontend_dev", state))
+    if not sends:
+        sends.append(Send("frontend_dev", state))
+    names = [s.node for s in sends]
+    logger.info("路由: dev_scope=%s 启动 %s", scope, names)
+    return sends
 
 
 def route_after_review(state: DevState) -> Literal["test", "parallel_dev", "deliver"]:
@@ -1258,7 +1358,14 @@ def build_pipeline():
     graph.add_node("supervisor", _with_retry(node_supervisor))
     graph.add_node("backend_dev", _with_retry(node_backend_dev))
     graph.add_node("frontend_dev", _with_retry(node_frontend_dev))
-    graph.add_node("join", lambda s: _log(s, "Join", "并行开发完成，汇合进入评审"))
+    graph.add_node(
+        "join",
+        lambda s: _log(
+            s,
+            "Join",
+            f"开发完成(scope={s.get('dev_scope', 'fullstack')})，汇合进入评审",
+        ),
+    )
     graph.add_node("code_review", _with_retry(node_code_review))
     graph.add_node("test", _with_retry(node_test))
     graph.add_node("fix_loop", fix_sub)  # 子图嵌套
@@ -1311,6 +1418,7 @@ def _build_initial_state(
         "merge_frontend_subdir": (merge_frontend_subdir or cfg.MERGE_FRONTEND_SUBDIR).strip(),
         "merge_result": {},
         "tasks": [],
+        "dev_scope": "fullstack",
         "backend_files": {},
         "frontend_files": {},
         "defects": [],
