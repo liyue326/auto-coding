@@ -59,6 +59,8 @@ def render_agent_cards(outputs: dict):
         icon, desc = AGENT_META.get(name, ("🤖", ""))
         with cols[i % 2]:
             with st.expander(f"{icon} **{name}** — {desc}", expanded=(name in ("Supervisor", "Deliver"))):
+                if isinstance(data, dict) and data.get("code_source"):
+                    st.caption(f"代码来源: **{data['code_source']}**（llm=模型生成 / template=兜底模板）")
                 st.json(data)
 
 
@@ -86,6 +88,14 @@ with st.sidebar:
     st.title("⚙️ 运行配置")
     st.caption(f"Mock 模式: **{'开启' if cfg.USE_MOCK_LLM else '关闭'}**")
     st.caption(f"模型: `{cfg.LLM_MODEL}`")
+    try:
+        from observability import setup_langsmith
+        ls_on = cfg.LANGSMITH_TRACING and bool(cfg.LANGSMITH_API_KEY)
+    except ImportError:
+        ls_on = False
+    st.caption(
+        f"LangSmith: **{'已开启' if ls_on else '未开启'}** · project `{cfg.LANGSMITH_PROJECT}`"
+    )
     output_dir = st.text_input("输出根目录", value=str(cfg.DEFAULT_OUTPUT_DIR))
 
     st.markdown("**合并到主项目**")
@@ -300,11 +310,42 @@ if result:
         st.info(f"代码已写入独立目录: `{out}`")
 
     merge = result.get("merge_result") or {}
+    if merge.get("needs_manual_resolution"):
+        st.warning(
+            f"检测到 **{len(merge.get('conflicts', []))}** 个文件冲突，未自动覆盖，需人工合并"
+        )
+        st.markdown(
+            "在主项目 `.merge_conflicts/<run>/` 下，每个冲突有：\n"
+            "- `*.current` — 你项目里现有代码\n"
+            "- `*.incoming` — 本次流水线新生成代码\n\n"
+            "对比合并后，把结果写回 `backend/` 或 `frontend/` 对应路径。"
+        )
+        if merge.get("conflicts_report"):
+            st.code(merge["conflicts_report"])
+        with st.expander("冲突文件列表", expanded=True):
+            st.json(merge.get("conflicts", []))
     if merge.get("ok"):
         st.success(
-            f"已合并到主项目 · backend `{merge.get('backend_dir')}` · "
-            f"frontend `{merge.get('frontend_dir')}`"
+            f"已合并到主项目 · 策略 `{merge.get('conflict_mode', '-')}` · "
+            f"backend {len(merge.get('backend_files', []))} 个 · "
+            f"frontend {len(merge.get('frontend_files', []))} 个"
         )
+        if merge.get("overwritten"):
+            with st.expander(f"已覆盖 {len(merge['overwritten'])} 个文件"):
+                st.write(merge["overwritten"])
+        if merge.get("skipped") and not merge.get("needs_manual_resolution"):
+            with st.expander(f"已跳过 {len(merge['skipped'])} 个文件（无变化或 skip 模式）"):
+                st.write(merge["skipped"])
+        if merge.get("backed_up"):
+            with st.expander(f"已备份 {len(merge['backed_up'])} 个旧文件"):
+                st.write(merge["backed_up"])
+    elif merge.get("reason") == "merge_disabled":
+        st.info("本次未合并到主项目（侧边栏未勾选「交付后自动合并」）")
+        if out:
+            st.code(
+                f"python3 pipeline.py --merge-run {out} -m {merge_target or cfg.MERGE_TARGET_ROOT}",
+                language="bash",
+            )
     elif merge and not merge.get("skipped"):
         st.warning(f"合并未成功: {merge.get('error', '未知原因')}")
 

@@ -68,6 +68,15 @@ MERGE_OVERWRITE: bool = os.getenv("MERGE_OVERWRITE", "true").strip().lower() in 
     "true",
     "yes",
 )
+# 冲突策略:
+#   manual 检测差异，冲突不覆盖，导出对比文件供人工合并（推荐）
+#   overwrite 直接覆盖 | skip 跳过已存在 | backup 先 .bak 再覆盖
+MERGE_CONFLICT_MODE: str = os.getenv("MERGE_CONFLICT_MODE", "manual").strip().lower()
+if MERGE_CONFLICT_MODE not in ("overwrite", "skip", "backup", "manual"):
+    MERGE_CONFLICT_MODE = "manual"
+
+# 合并时忽略的系统/垃圾文件
+MERGE_IGNORE_NAMES = {".DS_Store", "Thumbs.db", ".gitkeep"}
 
 
 def resolve_merge_target(path_str: str = "") -> Path:
@@ -77,6 +86,17 @@ def resolve_merge_target(path_str: str = "") -> Path:
         return Path()
     return Path(raw).expanduser().resolve()
 
+
+# ── LangSmith 观测 ──────────────────────────────────────────────────────
+# https://smith.langchain.com → Settings → API Keys
+LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", os.getenv("LANGCHAIN_API_KEY", "")).strip()
+LANGSMITH_TRACING: bool = os.getenv("LANGCHAIN_TRACING_V2", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+LANGSMITH_PROJECT: str = os.getenv("LANGCHAIN_PROJECT", "multi-agent-dev-pipeline").strip()
+LANGSMITH_ENDPOINT: str = os.getenv("LANGCHAIN_ENDPOINT", "https://api.smith.langchain.com").strip()
 
 # ── 日志 ────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

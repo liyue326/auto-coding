@@ -85,8 +85,10 @@ _SYSTEM = {
 - api/routes.py
 - schema.sql
 
-## 输出
-生成可运行代码；若 LLM 输出文件 JSON，格式：{"files": {"path": "content"}}""",
+## 输出要求（必须遵守）
+仅输出一个 JSON 对象，不要 markdown 包裹，格式：
+{"files": {"models/user.py": "完整文件内容", "api/routes.py": "...", "schema.sql": "..."}}
+根据业务需求调整表结构、接口路径与业务逻辑，不要照搬固定登录模板（除非需求就是登录）。""",
     "frontend": """你是前端开发 Agent，使用 Vue 3 实现页面与交互。
 
 ## 职责
@@ -99,8 +101,10 @@ _SYSTEM = {
 - src/views/<Page>View.vue
 - src/router/index.js
 
-## 输出
-生成可运行代码；字段名与 api_contract 严格一致""",
+## 输出要求（必须遵守）
+仅输出一个 JSON 对象，不要 markdown 包裹，格式：
+{"files": {"src/api/xxx.js": "...", "src/views/XxxView.vue": "...", "src/router/index.js": "..."}}
+页面与路由必须匹配业务需求与 api_contract，不要每次生成相同的登录页（除非需求就是登录）。""",
     "code_review": f"""你是代码评审 Agent，评审 Python FastAPI + Vue 3 全栈代码。
 
 ## 评分维度（满分 100）
@@ -130,7 +134,10 @@ _SYSTEM = {
 ## 规则
 - 只修复 defects 中列出的问题，不做无关重构
 - 保持 api_contract 不变
-- 后端 Python、前端 Vue 分别修改对应文件""",
+- 输出完整修正后的文件
+
+## 输出 JSON
+{"files": {"相对路径": "修复后的完整文件内容"}}""",
 }
 
 # ── User Prompt 模板 ────────────────────────────────────────────────────
@@ -188,11 +195,11 @@ _USER = {
     "bug_fix": """## 缺陷清单
 {defects}
 
-## 后端代码摘要
-{backend_summary}
+## 当前后端文件
+{backend_files}
 
-## 前端代码摘要
-{frontend_summary}
+## 当前前端文件
+{frontend_files}
 
-请说明修复方案并确保代码已修正关键问题。""",
+请输出修复后的 files JSON。""",
 }

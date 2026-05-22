@@ -12,6 +12,7 @@
 u/
 ├── config.py          # 全局配置（读取 .env）
 ├── prompts.py         # 各 Agent 的 Prompt 模板
+├── observability.py   # LangSmith 追踪与指标
 ├── pipeline.py        # LangGraph 流水线核心 + CLI 入口
 ├── app.py             # Streamlit 可视化界面
 ├── requirements.txt   # Python 依赖
@@ -58,6 +59,7 @@ MERGE_TARGET_ROOT=/Users/liyue/Desktop/all
 MERGE_BACKEND_SUBDIR=backend
 MERGE_FRONTEND_SUBDIR=frontend
 MERGE_OVERWRITE=true
+MERGE_CONFLICT_MODE=manual
 ```
 
 | 变量 | 说明 |
@@ -70,6 +72,34 @@ MERGE_OVERWRITE=true
 | `MERGE_ENABLED` | `true` 交付后自动合并 |
 | `MERGE_BACKEND_SUBDIR` | 后端子目录名，默认 `backend` |
 | `MERGE_FRONTEND_SUBDIR` | 前端子目录名，默认 `frontend` |
+| `MERGE_CONFLICT_MODE` | 见下方「合并冲突」 |
+| `LANGCHAIN_TRACING_V2` | `true` 开启 LangSmith |
+| `LANGCHAIN_PROJECT` | LangSmith 项目名 |
+| `LANGSMITH_API_KEY` | LangSmith API Key（[smith.langchain.com](https://smith.langchain.com) 申请） |
+
+### LangSmith 多指标观测
+
+在 `.env` 中开启后，每次流水线会在 LangSmith 产生完整链路：
+
+```env
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_PROJECT=multi-agent-dev-pipeline
+LANGSMITH_API_KEY=lsv2_你的key
+```
+
+**可在面板查看的指标：**
+
+| 类别 | 指标 / 标签 |
+|------|-------------|
+| 链路 | 整图 `multi-agent-pipeline`、各 Agent 节点耗时 |
+| LLM | 每次调用的 token、延迟、模型名（tags: `agent:Supervisor` 等） |
+| 评审 | `review_score`、`review_passed` |
+| 测试 | `test_passed`、`defect_count` |
+| 合并 | `merge_ok`、`merge_conflict_count`、`merge_needs_manual` |
+| 产出 | `backend_file_count`、`frontend_file_count`、`delivered` |
+| 汇总 | 运行结束 `pipeline_summary` 节点 |
+
+打开 https://smith.langchain.com → 选择 project → 按 tag `agent:CodeReview` 或 metadata 筛选。
 
 ### 3. 启动方式
 
@@ -164,6 +194,39 @@ output/run_20260522_183045/
 ```
 
 **说明**：`output/` 保留每次运行快照；主项目目录用于日常开发合并，两者互不影响。
+
+### 合并冲突（人工解决）
+
+默认 `MERGE_CONFLICT_MODE=manual`：合并前**逐文件比对内容**，若主项目已有文件且与新生成不同，则**不自动覆盖**，并导出对比文件：
+
+```text
+{主项目}/.merge_conflicts/run_20260522_184431/
+├── manifest.json              # 冲突清单与处理说明
+├── backend/api/
+│   ├── routes.py.current      # 主项目现有版本
+│   └── routes.py.incoming     # 流水线新生成版本
+└── frontend/src/...
+```
+
+| 模式 | 行为 |
+|------|------|
+| **manual**（默认） | 有差异 → 导出 `.current` / `.incoming`，人工合并后写回 `backend/`、`frontend/` |
+| overwrite | 直接覆盖 |
+| skip | 目标已存在则跳过 |
+| backup | 覆盖前生成 `.bak` |
+
+**人工处理步骤**：
+
+1. 打开 `manifest.json` 查看冲突列表  
+2. 用 diff 工具对比 `.current` 与 `.incoming`  
+3. 合并结果保存到主项目对应路径（如 `all/backend/api/routes.py`）  
+4. 确认无误后删除 `.merge_conflicts` 下该 run 目录  
+
+手动触发合并（含冲突检测）：
+
+```bash
+python3 pipeline.py --merge-run output/run_xxx --merge-mode manual
+```
 
 ---
 
