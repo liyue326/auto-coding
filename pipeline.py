@@ -44,6 +44,10 @@ def _append_logs(left: list, right: list) -> list:
     return (left or []) + (right or [])
 
 
+def _append_fix_experiences(left: list, right: list) -> list:
+    return (left or []) + (right or [])
+
+
 class DevState(TypedDict, total=False):
     """统一管理需求、任务、代码、评审、测试、缺陷等全流程数据。"""
 
@@ -75,6 +79,8 @@ class DevState(TypedDict, total=False):
     defects: list[dict]
     fix_round: int
     review_round: int
+    fix_experiences: Annotated[list[dict], _append_fix_experiences]
+    memory_retrieved: list[dict]
 
     # 流程控制
     phase: str
@@ -912,6 +918,43 @@ def node_code_review(state: DevState) -> dict:
     return updates
 
 
+def _collect_test_defects(
+    state: DevState,
+    backend: dict[str, str],
+    frontend: dict[str, str],
+) -> list[dict]:
+    """静态缺陷检测（进入 BugFix 的条件）。"""
+    defects: list[dict] = []
+    scope = state.get("dev_scope") or "fullstack"
+
+    if scope != "frontend_only":
+        for path, content in backend.items():
+            if not path.endswith(".py"):
+                continue
+            is_route = path.endswith("routes.py") or "APIRouter" in content or "@router." in content
+            if is_route and "HTTPException" not in content:
+                defects.append(
+                    {
+                        "id": "D-001",
+                        "module": "backend",
+                        "desc": f"{path} 建议补充 HTTPException 异常处理",
+                    }
+                )
+                break
+
+    for path, content in frontend.items():
+        if path.endswith(".vue") and "password" in content.lower() and 'type="password"' not in content:
+            defects.append(
+                {
+                    "id": f"D-fe-{path}",
+                    "module": "frontend",
+                    "desc": f"{path} 密码框建议 type=password",
+                }
+            )
+
+    return defects
+
+
 def node_test(state: DevState) -> dict:
     """测试 Agent: 生成并执行检测，输出缺陷清单。"""
     updates = _log(state, "TestAgent", "开始自动化测试")
@@ -927,22 +970,31 @@ def node_test(state: DevState) -> dict:
         frontend_files=list(frontend.keys()),
         api_contract=json.dumps(state.get("api_contract") or {}, ensure_ascii=False)[:1500],
     )
-    _invoke_llm(system, user)
+    raw = _invoke_llm(system, user)
+    llm_test = _parse_json_from_llm(raw)
 
-    defects: list[dict] = []
-    scope = state.get("dev_scope") or "fullstack"
-    routes_py = backend.get("api/routes.py", "")
-    if scope != "frontend_only" and routes_py and "HTTPException" not in routes_py:
-        defects.append({"id": "D-001", "module": "backend", "desc": "api/routes.py 建议补充 HTTPException"})
-    for path, content in frontend.items():
-        if path.endswith(".vue") and "password" in content.lower() and 'type="password"' not in content:
+    defects: list[dict] = _collect_test_defects(state, backend, frontend)
+    for d in llm_test.get("defects") or []:
+        if isinstance(d, dict) and d.get("desc"):
             defects.append(
                 {
-                    "id": f"D-fe-{path}",
-                    "module": "frontend",
-                    "desc": f"{path} 密码框建议 type=password",
+                    "id": str(d.get("id") or f"D-llm-{len(defects)}"),
+                    "module": d.get("module") or "backend",
+                    "desc": str(d.get("desc", ""))[:300],
+                    "severity": d.get("severity", "medium"),
                 }
             )
+
+    scope = state.get("dev_scope") or "fullstack"
+    if not defects:
+        logger.info(
+            "TestAgent 未检出缺陷 scope=%s backend=%s frontend=%s（故不进 BugFix）",
+            scope,
+            list(backend.keys()),
+            list(frontend.keys()),
+        )
+    else:
+        logger.info("TestAgent 检出缺陷 %d 条: %s", len(defects), [d.get("id") for d in defects])
 
     passed = len(defects) == 0
     result = {
@@ -968,13 +1020,29 @@ def node_test(state: DevState) -> dict:
 
 
 def node_bug_fix(state: DevState) -> dict:
-    """缺陷修复 Agent: 依据缺陷清单修正前后端代码。"""
+    """缺陷修复 Agent: RAG 检索历史成功修复 + LLM 改代码。"""
     fix_round = (state.get("fix_round") or 0) + 1
     updates = _log(state, "BugFix", f"开始第 {fix_round} 轮缺陷修复")
     defects = state.get("defects") or []
+    req = state.get("requirement", "")
+    scope = state.get("dev_scope") or "fullstack"
 
     backend = dict(state.get("backend_files") or {})
     frontend = dict(state.get("frontend_files") or {})
+
+    memory_cases: list[dict] = []
+    hints = ""
+    try:
+        from memory import format_hints_for_prompt, retrieve_similar_fixes
+
+        memory_cases = retrieve_similar_fixes(req, scope, defects)
+        hints = format_hints_for_prompt(memory_cases)
+        if memory_cases:
+            updates["logs"] = updates.get("logs", []) + [
+                f"[BugFix] 检索到 {len(memory_cases)} 条历史成功修复经验"
+            ]
+    except Exception as e:
+        logger.warning("修复经验检索跳过: %s", e)
 
     system = build_system("bug_fix")
     user = build_user(
@@ -982,9 +1050,11 @@ def node_bug_fix(state: DevState) -> dict:
         defects=json.dumps(defects, ensure_ascii=False),
         backend_files=json.dumps({k: v[:3000] for k, v in backend.items()}, ensure_ascii=False),
         frontend_files=json.dumps({k: v[:3000] for k, v in frontend.items()}, ensure_ascii=False),
+        fix_experience_hints=hints or "（暂无相似历史案例）",
     )
     raw = _invoke_llm(system, user)
     patched = _parse_files_from_llm(raw)
+    fix_action = "llm_patched" if patched else "rule_fallback"
     if patched:
         for path, content in patched.items():
             if path.startswith("src/") or path.endswith(".vue") or path.endswith(".js"):
@@ -1005,16 +1075,38 @@ def node_bug_fix(state: DevState) -> dict:
                 path = "api/routes.py"
                 if path in backend and "HTTPException" not in backend[path]:
                     backend[path] += "\n# patched: error handling\n"
+                    fix_action = "rule_fallback_http"
+
+    experience = {
+        "round": fix_round,
+        "defects": [dict(d) for d in defects if isinstance(d, dict)],
+        "patched_files": list(patched.keys()) if patched else [],
+        "fix_action": fix_action,
+    }
 
     updates.update(
         {
             "backend_files": backend,
             "frontend_files": frontend,
             "fix_round": fix_round,
-            **_save_agent_output(state, "BugFix", {"fixed": [d["id"] for d in defects], "round": fix_round}),
+            "fix_experiences": [experience],
+            "memory_retrieved": [
+                {"case_id": c.get("case_id"), "distance": c.get("distance")}
+                for c in memory_cases
+            ],
+            **_save_agent_output(
+                state,
+                "BugFix",
+                {
+                    "fixed": [d.get("id") for d in defects if isinstance(d, dict)],
+                    "round": fix_round,
+                    "memory_retrieved": updates.get("memory_retrieved", []),
+                    "fix_action": fix_action,
+                },
+            ),
         }
     )
-    logger.info("BugFix 第 %s 轮完成", fix_round)
+    logger.info("BugFix 第 %s 轮完成 action=%s", fix_round, fix_action)
     return updates
 
 
@@ -1070,6 +1162,20 @@ def node_deliver(state: DevState) -> dict:
         updates["logs"] = updates.get("logs", []) + ["[Deliver] 未启用合并到主项目"]
 
     state_for_write["merge_result"] = merge_result
+    memory_ingested = 0
+    try:
+        from memory import ingest_successful_run
+        from memory.store import collection_count
+
+        final_state = {**state, **updates, "merge_result": merge_result}
+        memory_ingested = ingest_successful_run(final_state, run_id=out.name)
+        if memory_ingested:
+            updates["logs"] = updates.get("logs", []) + [
+                f"[Deliver] 已入库 {memory_ingested} 条成功修复经验（库内共约 {collection_count()} 条）"
+            ]
+    except Exception as e:
+        logger.warning("修复经验入库跳过: %s", e)
+
     (out / "reports" / "summary.json").write_text(
         json.dumps(
             {
@@ -1079,6 +1185,7 @@ def node_deliver(state: DevState) -> dict:
                 "defects": state.get("defects"),
                 "delivered": True,
                 "merge": merge_result,
+                "memory_ingested": memory_ingested,
                 "output_dir": str(out),
             },
             ensure_ascii=False,
@@ -1087,7 +1194,11 @@ def node_deliver(state: DevState) -> dict:
         encoding="utf-8",
     )
 
-    deliver_payload = {"path": str(out), "merge": merge_result}
+    deliver_payload = {
+        "path": str(out),
+        "merge": merge_result,
+        "memory_ingested": memory_ingested,
+    }
     updates.update(
         {
             "delivered": True,
@@ -1096,7 +1207,7 @@ def node_deliver(state: DevState) -> dict:
             **_save_agent_output(state, "Deliver", deliver_payload),
         }
     )
-    logger.info("Deliver 输出目录: %s", out)
+    logger.info("Deliver 输出目录: %s memory_ingested=%s", out, memory_ingested)
     return updates
 
 
@@ -1123,7 +1234,7 @@ def route_parallel_dev(state: DevState) -> list[Send]:
 
 
 def route_after_review(state: DevState) -> Literal["test", "parallel_dev", "deliver"]:
-    """评审后条件分支: 通过→测试; 不通过且未超重试→回开发; 否则强制交付演示。"""
+    """评审后条件分支: 通过→测试; 不通过且未超重试→回开发; 否则强制进入测试。"""
     if state.get("review_passed"):
         return "test"
     review_round = state.get("review_round") or 0
@@ -1137,12 +1248,18 @@ def route_after_review(state: DevState) -> Literal["test", "parallel_dev", "deli
 def route_after_test(state: DevState) -> Literal["bug_fix", "deliver"]:
     """测试后: 有缺陷且未超重试→修复子图; 否则交付。"""
     if state.get("test_passed"):
+        logger.info("路由: 测试通过，进入 Deliver（无 BugFix）")
         return "deliver"
     fix_round = state.get("fix_round") or 0
+    defects = state.get("defects") or []
     if fix_round < cfg.MAX_FIX_ROUNDS:
-        logger.info("路由: 测试失败，进入缺陷修复 (round=%s)", fix_round)
+        logger.info(
+            "路由: 测试失败 defects=%d，进入 BugFix (round=%s)",
+            len(defects),
+            fix_round,
+        )
         return "bug_fix"
-    logger.warning("路由: 修复轮次耗尽，强制交付")
+    logger.warning("路由: 修复轮次耗尽，强制 Deliver")
     return "deliver"
 
 
@@ -1239,6 +1356,8 @@ def _build_initial_state(
         "defects": [],
         "fix_round": 0,
         "review_round": 0,
+        "fix_experiences": [],
+        "memory_retrieved": [],
         "logs": [],
         "agent_outputs": {},
         "errors": [],

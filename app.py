@@ -86,6 +86,18 @@ with st.sidebar:
     st.title("⚙️ 运行配置")
     st.caption(f"Mock 模式: **{'开启' if cfg.USE_MOCK_LLM else '关闭'}**")
     st.caption(f"模型: `{cfg.LLM_MODEL}`")
+    mem_on = st.checkbox(
+        "修复经验库 (Chroma)",
+        value=cfg.MEMORY_ENABLED,
+        help="测试通过且经 BugFix 后自动入库；BugFix 时检索相似成功案例",
+    )
+    if mem_on:
+        try:
+            from memory.store import collection_count
+
+            st.caption(f"库内成功修复案例: **{collection_count()}** 条")
+        except Exception:
+            st.caption("库内案例: （未安装 chromadb 或尚未初始化）")
     output_dir = st.text_input("输出根目录", value=str(cfg.DEFAULT_OUTPUT_DIR))
 
     st.markdown("**合并到主项目**")
@@ -152,8 +164,8 @@ with st.sidebar:
         2. 按 scope **并行** 开发（可仅前端或仅后端）  
         3. 代码评审 → 条件分支  
         4. 自动化测试  
-        5. 有 BUG → **修复子图** 循环  
-        6. 通过后 **独立目录** 交付  
+        5. 有 BUG → **修复子图**（Chroma 检索历史成功案例）  
+        6. 通过后 **独立目录** 交付并入库经验  
         """
     )
 

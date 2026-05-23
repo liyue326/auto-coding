@@ -109,6 +109,10 @@ frontend_only 时 tasks 不得含 role=backend。""",
 {"passed": bool, "cases_run": int, "failed": int, "defects": [...], "summary": "..."}""",
     "bug_fix": """你是缺陷修复 Agent，根据 defects 最小化修复。
 
+## 规则
+- 可参考「历史成功修复」中的手法，但不得改变当前用户需求与业务类型
+- 只修 defects 列出的问题
+
 ## 输出 JSON
 {"files": {"相对路径": "修复后的完整文件内容"}}""",
 }
@@ -176,6 +180,8 @@ _USER = {
 
 ## 当前前端文件
 {frontend_files}
+
+{fix_experience_hints}
 
 请输出修复后的 files JSON。""",
 }

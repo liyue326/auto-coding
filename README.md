@@ -73,6 +73,39 @@ MERGE_CONFLICT_MODE=overwrite
 | `MERGE_FRONTEND_SUBDIR` | 前端子目录名，默认 `frontend` |
 | `MERGE_OVERWRITE` | `true` 时默认**覆盖**主项目中已存在文件 |
 | `MERGE_CONFLICT_MODE` | `overwrite` / `manual` / `skip` / `backup` |
+| `MEMORY_ENABLED` | `true` 开启 Chroma 修复经验库 |
+| `CHROMA_PERSIST_DIR` | 向量库目录，默认 `data/chroma` |
+| `MEMORY_TOP_K` | BugFix 检索历史案例条数，默认 `3` |
+| `EMBEDDING_MODEL` | 嵌入模型，默认 `text-embedding-v3`（DashScope） |
+
+### 修复经验向量库（Chroma）
+
+- **只入库成功修复**：流水线 **测试通过** 且经历过 **BugFix** 时，Deliver 写入**最后一轮**修复记录
+- **检索时机**：BugFix 根据当前缺陷 + 需求检索 Top-K 相似案例，注入 Prompt（仅参考手法，不改业务）
+- **数据目录**：`data/chroma/`（已加入 `.gitignore`）
+
+```bash
+pip install -r requirements.txt
+# 通义 DashScope 建议: EMBEDDING_MODEL=text-embedding-v3
+```
+
+### 何时进入 BugFix
+
+流水线只有在 **CodeReview 通过 → TestAgent 检出缺陷 → 测试未通过** 时才会进入 BugFix：
+
+```text
+评审通过 → 测试 → defects 非空 → BugFix → 再测 → … → 通过 → Deliver（入库经验）
+```
+
+常见触发条件：
+
+- 后端路由文件（含 `APIRouter` / `routes.py`）缺少 `HTTPException`
+- 前端 `.vue` 含 `password` 但未设置 `type="password"`
+- TestAgent LLM 返回的 `defects` 列表非空
+
+**仅前端需求**（如「画圆只要前端」）通常不会进 BugFix，因无后端路由检测项。
+
+日志中应出现：`检出缺陷 N 条` → `路由: 测试失败…进入 BugFix`。
 
 ### 3. 启动方式
 

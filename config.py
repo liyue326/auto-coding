@@ -87,6 +87,20 @@ def resolve_merge_target(path_str: str = "") -> Path:
     return Path(raw).expanduser().resolve()
 
 
+# ── 修复经验向量库（Chroma，仅入库成功修复）────────────────────────────
+MEMORY_ENABLED: bool = os.getenv("MEMORY_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+CHROMA_PERSIST_DIR: Path = Path(
+    os.getenv("CHROMA_PERSIST_DIR", str(PROJECT_ROOT / "data" / "chroma"))
+).expanduser()
+CHROMA_COLLECTION: str = os.getenv("CHROMA_COLLECTION", "fix_experiences").strip()
+MEMORY_TOP_K: int = int(os.getenv("MEMORY_TOP_K", "3"))
+# DashScope 兼容接口常用 text-embedding-v3；OpenAI 官方可用 text-embedding-3-small
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v3").strip()
+
 # ── 日志 ────────────────────────────────────────────────────────────────
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
