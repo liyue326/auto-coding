@@ -1,0 +1,11 @@
+{
+  "run": "run_20260523_093538",
+  "requirement": "在健康状态页面 加上 当前时间",
+  "source_path": "/Users/liyue/Desktop/all",
+  "sandbox_path": "/Users/liyue/Desktop/u/data/workspaces/all/sandbox",
+  "export_dir": "/Users/liyue/Desktop/u/data/workspaces/all/export/run_20260523_093538",
+  "files_dir": "/Users/liyue/Desktop/u/data/workspaces/all/export/run_20260523_093538/files",
+  "merge_preview": {},
+  "status": "pending_approval",
+  "how_to_apply": "在 Streamlit 点击「确认写入老项目」，或 CLI: python3 -m legacy.export_cli /Users/liyue/Desktop/u/data/workspaces/all/export/run_20260523_093538"
+}

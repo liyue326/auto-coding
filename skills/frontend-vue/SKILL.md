@@ -19,6 +19,7 @@ frontend/
 ## 组件规范
 - 使用 `<script setup>` + Composition API
 - 单文件组件: `views/LoginView.vue`
+- **存量改造**：用户说「在原有/登录页面改」时，必须修改已有 `LoginView.vue` 全文，禁止新建 `App.vue` 或其它页面替代
 - 表单字段与 api_contract body 字段名一致
 
 ## 请求封装

@@ -32,7 +32,9 @@ st.markdown(
 )
 
 AGENT_META = {
-    "Supervisor": ("🎯", "任务拆分 · 流程管控"),
+    "PrepareWorkspace": ("📂", "隔离导入 · 快照与索引"),
+    "ProjectAnalyst": ("🔬", "结构扫描 · 风格 · 可复用组件"),
+    "Supervisor": ("🎯", "Planner · 任务拆分"),
     "BackendDev": ("⚙️", "数据表 · API · 服务层"),
     "FrontendDev": ("🖥️", "Vue3 页面 · 路由 · API"),
     "CodeReview": ("🔍", "规范 · 一致性 · 安全"),
@@ -89,13 +91,16 @@ with st.sidebar:
     mem_on = st.checkbox(
         "修复经验库 (Chroma)",
         value=cfg.MEMORY_ENABLED,
-        help="测试通过且经 BugFix 后自动入库；BugFix 时检索相似成功案例",
+        help="仅当：测试通过 + 本轮走过 BugFix 时，按修复轮次入库（每轮一条）；未进 BugFix 的 run 不会增加条数",
     )
     if mem_on:
         try:
             from memory.store import collection_count
 
-            st.caption(f"库内成功修复案例: **{collection_count()}** 条")
+            n = collection_count()
+            st.caption(f"库内成功修复案例: **{n}** 条")
+            if n <= 1:
+                st.caption("条数少通常因：Mock/一次通过未进 BugFix，或仅跑过 1 次带修复的流水线")
         except Exception:
             st.caption("库内案例: （未安装 chromadb 或尚未初始化）")
     output_dir = st.text_input("输出根目录", value=str(cfg.DEFAULT_OUTPUT_DIR))
@@ -148,6 +153,7 @@ with st.sidebar:
 
     legacy_path = st.text_input(
         "存量项目路径（可选，任意本地目录）",
+        value=cfg.DEFAULT_LEGACY_PATH or "",
         placeholder="/path/to/old-project",
     )
     if legacy_path:
@@ -160,12 +166,14 @@ with st.sidebar:
     st.markdown("**流程说明**")
     st.markdown(
         """
-        1. Supervisor 拆分任务（识别 scope）  
-        2. 按 scope **并行** 开发（可仅前端或仅后端）  
-        3. 代码评审 → 条件分支  
-        4. 自动化测试  
-        5. 有 BUG → **修复子图**（Chroma 检索历史成功案例）  
-        6. 通过后 **独立目录** 交付并入库经验  
+        0. PrepareWorkspace 隔离复制老项目（不改原目录）  
+        1. **Project Analyst** 生成项目上下文报告（Planner 前置）  
+        2. Supervisor 拆分任务（识别 scope）  
+        3. 按 scope **并行** 开发（可仅前端或仅后端）  
+        4. 代码评审 → 条件分支  
+        5. 自动化测试  
+        6. 有 BUG → **修复子图**（Chroma 检索历史成功案例）  
+        7. 通过后 **导出包** 交付；人工确认后才写回老项目  
         """
     )
 
@@ -205,7 +213,9 @@ if run_btn:
         all_logs: list[str] = []
         result = None
         phase_weights = {
-            "Supervisor": 10,
+            "PrepareWorkspace": 3,
+            "ProjectAnalyst": 8,
+            "Supervisor": 12,
             "BackendDev": 30,
             "FrontendDev": 30,
             "Join": 45,
@@ -314,8 +324,15 @@ if result:
         st.info(f"本次开发范围：**{scope}**（fullstack=全栈 · frontend_only=仅前端 · backend_only=仅后端）")
     render_agent_cards(result.get("agent_outputs") or {})
 
-    if result.get("legacy_analysis"):
-        with st.expander("存量项目分析"):
+    report = result.get("project_context_report") or {}
+    if report.get("ok"):
+        with st.expander("Project Analyst 项目上下文报告"):
+            st.markdown(f"**摘要**：{report.get('summary', '')}")
+            if report.get("report_path"):
+                st.caption(f"报告文件：`{report['report_path']}`")
+            st.json(report)
+    elif result.get("legacy_analysis"):
+        with st.expander("存量项目分析（索引）"):
             st.json(result["legacy_analysis"])
 
     if review:

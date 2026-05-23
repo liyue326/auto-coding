@@ -149,7 +149,11 @@ python3 pipeline.py -r "你的需求" --no-merge
 ## 流水线说明
 
 ```text
-Supervisor（任务拆分 + API 契约）
+PrepareWorkspace（隔离复制老项目，只读快照 + 索引）
+    ↓
+Project Analyst（结构 / 代码风格 / 可复用组件 → 上下文报告）
+    ↓
+Supervisor / Planner（任务拆分 + API 契约，必读 Analyst 报告）
     ↓ 并行
 BackendDev（Python FastAPI）  +  FrontendDev（Vue 3）
     ↓ 汇合
@@ -161,7 +165,9 @@ Deliver（写入 output + 可选合并主项目）
 
 | Agent | 职责 |
 |-------|------|
-| Supervisor | 拆分任务、定义 API 契约 |
+| PrepareWorkspace | 复制老项目到 `data/workspaces/`，生成 `project_map.json`（不改原目录） |
+| Project Analyst | 扫描结构、提取风格、识别可复用组件，输出 `analyst_report.json` |
+| Supervisor | 拆分任务、定义 API 契约（消费 Analyst 报告） |
 | BackendDev | `models/`、`services/`、`api/routes.py`、`schema.sql` |
 | FrontendDev | `src/api/`、`src/views/*.vue`、`src/router/` |
 | CodeReview | 规范、安全、契约一致性评分 |

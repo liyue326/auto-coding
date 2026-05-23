@@ -53,6 +53,11 @@ class DevState(TypedDict, total=False):
 
     requirement: str
     legacy_path: str
+    legacy_workspace: dict
+    project_context_report: dict
+    touch_paths: dict  # {"backend": [...], "frontend": [...]}
+    export_package: dict
+    export_approved: bool
     output_dir: str
 
     # 合并到主项目（可配置，见 config.py / .env / Streamlit）
@@ -179,15 +184,28 @@ def scan_legacy_project(path_str: str) -> dict:
     }
 
 
+def _normalize_side_rel(rel: str, side: str) -> str:
+    """
+    去掉 LLM 常带的 side 前缀，避免写出 backend/backend、frontend/frontend 嵌套。
+    side: backend | frontend
+    """
+    p = str(rel).strip().replace("\\", "/").lstrip("/")
+    while p.startswith(f"{side}/"):
+        p = p[len(side) + 1 :]
+    return p or rel
+
+
 def write_artifacts(out_dir: Path, state: DevState) -> None:
     """将生成代码写入独立输出目录，不覆盖存量原文件。"""
     for rel, content in (state.get("backend_files") or {}).items():
-        target = out_dir / "backend" / rel
+        norm = _normalize_side_rel(rel, "backend")
+        target = out_dir / "backend" / norm
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
     for rel, content in (state.get("frontend_files") or {}).items():
-        target = out_dir / "frontend" / rel
+        norm = _normalize_side_rel(rel, "frontend")
+        target = out_dir / "frontend" / norm
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
 
@@ -196,6 +214,7 @@ def write_artifacts(out_dir: Path, state: DevState) -> None:
         "review": state.get("review_result"),
         "test": state.get("test_result"),
         "defects": state.get("defects"),
+        "fix_experiences": state.get("fix_experiences") or [],
         "delivered": state.get("delivered"),
         "merge": state.get("merge_result"),
         "output_dir": str(out_dir),
@@ -320,6 +339,9 @@ def merge_to_project(
             if not fp.is_file() or _should_ignore(fp):
                 continue
             rel = fp.relative_to(src)
+            rel_str = str(rel).replace("\\", "/")
+            if label in ("backend", "frontend") and rel_str.startswith(f"{label}/"):
+                rel = Path(_normalize_side_rel(rel_str, label))
             target = dst / rel
             rel_key = f"{label}/{rel}"
 
@@ -515,7 +537,9 @@ def _requirement_from_prompt(user: str) -> str:
 
 def _mock_agent_role(system: str) -> str:
     head = (system or "")[:800]
-    if "你是 Supervisor 调度 Agent" in head:
+    if "你是 Project Analyst" in head or "项目分析师" in head:
+        return "project_analyst"
+    if "你是 Supervisor" in head or "你是 Supervisor（Planner）" in head:
         return "supervisor"
     if "你是后端开发 Agent" in head:
         return "backend"
@@ -534,6 +558,15 @@ def _mock_llm_response(system: str, user: str) -> str:
     """Mock：按需求原文与 scope 生成，不写死登录/注册。"""
     req = _requirement_from_prompt(user)
     role = _mock_agent_role(system)
+    if role == "project_analyst":
+        return json.dumps(
+            {
+                "summary": f"Mock 项目分析: {req[:80]}",
+                "recommendations_for_planner": ["按需求原文拆分 scope"],
+                "constraints": ["遵循现有目录结构"],
+            },
+            ensure_ascii=False,
+        )
     if role == "supervisor":
         scope = _resolve_dev_scope(req, [], {})
         tasks = _default_tasks_for_scope(scope, req)
@@ -589,6 +622,10 @@ def _parse_files_from_llm(raw: str) -> dict[str, str]:
         out: dict[str, str] = {}
         for path, content in files.items():
             p = str(path).strip().replace("\\", "/").lstrip("/")
+            if p.startswith("backend/"):
+                p = _normalize_side_rel(p, "backend")
+            elif p.startswith("frontend/"):
+                p = _normalize_side_rel(p, "frontend")
             if p and content is not None:
                 body = content if isinstance(content, str) else str(content)
                 if body and not body.endswith("\n"):
@@ -707,25 +744,244 @@ def _with_retry(fn, attempts: int | None = None):
     return wrapped
 
 
+def node_prepare_workspace(state: DevState) -> dict:
+    """隔离导入老项目：复制快照 + 索引（绝不修改原目录）。"""
+    legacy = (state.get("legacy_path") or cfg.DEFAULT_LEGACY_PATH).strip()
+    if not legacy:
+        return _log(state, "PrepareWorkspace", "未配置老项目路径，跳过", set_phase=False)
+
+    updates = _log(state, "PrepareWorkspace", f"准备老项目工作区: {legacy}", set_phase=False)
+    try:
+        from legacy import format_legacy_context, prepare_legacy_workspace
+
+        ws = prepare_legacy_workspace(legacy)
+        updates["legacy_workspace"] = ws
+        updates["legacy_path"] = legacy
+        if ws.get("ok"):
+            idx = ws.get("index") or {}
+            updates["logs"] = updates.get("logs", []) + [
+                f"[PrepareWorkspace] 快照 {ws.get('snapshot_path')} · "
+                f"索引 {idx.get('file_count', 0)} 个文件 · stack={idx.get('stack')}"
+            ]
+        else:
+            updates["logs"] = updates.get("logs", []) + [
+                f"[PrepareWorkspace] 失败: {ws.get('error')}"
+            ]
+    except Exception as e:
+        logger.exception("工作区准备失败")
+        updates["legacy_workspace"] = {"ok": False, "error": str(e)}
+        updates["logs"] = updates.get("logs", []) + [f"[PrepareWorkspace] 异常: {e}"]
+    return updates
+
+
+def _dev_existing_files_context(
+    state: DevState, side: str
+) -> tuple[dict[str, str], str, list[str]]:
+    """加载快照中待改文件全文，供 Dev Prompt 使用。"""
+    ws = state.get("legacy_workspace") or {}
+    if not ws.get("ok"):
+        return {}, "从零实现（未准备老项目工作区）", []
+
+    req = state.get("requirement", "")
+    report = state.get("project_context_report") or {}
+    index = ws.get("index") or {}
+    touch_from_state = (state.get("touch_paths") or {}).get(side) or []
+
+    try:
+        from legacy import (
+            format_existing_files_block,
+            infer_touch_paths,
+            load_source_files,
+            wants_modify_existing,
+        )
+
+        modify = wants_modify_existing(req) or bool(touch_from_state) or bool(
+            report.get("suggested_touch_paths")
+        )
+        if not modify:
+            return {}, "从零实现（未识别为存量页面改造）", []
+
+        paths = touch_from_state or infer_touch_paths(req, report, index, side)
+        files = load_source_files(ws, paths, side)
+        if not files:
+            return {}, "存量改造但未在快照中找到目标文件，请检查路径", paths
+
+        block = format_existing_files_block(files, side)
+        mode = (
+            "存量改造：必须在「待修改已有文件」上增改；"
+            "输出完整文件内容；禁止新建 App.vue 等替代页面"
+        )
+        return files, block if block else mode, list(files.keys())
+    except Exception as e:
+        logger.warning("加载待改文件失败: %s", e)
+        return {}, f"加载失败: {e}", []
+
+
+def _filter_dev_output(
+    files: dict[str, str], touch_paths: list[str], side: str
+) -> dict[str, str]:
+    """存量改造时丢弃 LLM 擅自新建的路径。"""
+    if not touch_paths:
+        return files
+    allowed = {_normalize_side_rel(p, side) for p in touch_paths}
+    if side == "frontend":
+        if any("LoginView" in p for p in allowed):
+            allowed.add("src/api/auth.js")
+        if any("logout" in (files.get(p) or "").lower() for p in files):
+            allowed.add("src/api/auth.js")
+    if side == "backend" and any("routes" in p or "api" in p for p in allowed):
+        allowed.add("api/routes.py")
+        allowed.add("services/auth_service.py")
+
+    out: dict[str, str] = {}
+    for path, content in files.items():
+        norm = _normalize_side_rel(path, side)
+        if norm in allowed:
+            out[norm] = content
+    if out:
+        dropped = set(files) - set(out)
+        if dropped:
+            logger.info("%s 丢弃非待改路径: %s", side, dropped)
+        return out
+    return files
+
+
+def _project_context_text(state: DevState) -> str:
+    """Supervisor / Dev 使用的项目上下文文本。"""
+    req = state.get("requirement", "")
+    report = state.get("project_context_report") or {}
+    if report.get("ok"):
+        try:
+            from legacy import format_report_for_planner
+
+            return format_report_for_planner(report, req)
+        except Exception:
+            pass
+    ws = state.get("legacy_workspace") or {}
+    if ws.get("ok"):
+        try:
+            from legacy import format_legacy_context
+
+            return format_legacy_context(ws, req)
+        except Exception:
+            pass
+    legacy = state.get("legacy_path", "")
+    if legacy:
+        info = scan_legacy_project(legacy)
+        return json.dumps(info, ensure_ascii=False)[:2000]
+    return "（无老项目上下文）"
+
+
+def node_project_analyst(state: DevState) -> dict:
+    """Project Analyst：Planner 之前分析老项目，生成上下文报告。"""
+    updates = _log(state, "ProjectAnalyst", "开始项目结构分析与上下文报告")
+    req = state.get("requirement", "")
+    ws = state.get("legacy_workspace") or {}
+
+    if not ws.get("ok"):
+        report = {"ok": False, "skipped": True, "error": ws.get("error", "无工作区")}
+        updates["project_context_report"] = report
+        updates["logs"] = updates.get("logs", []) + ["[ProjectAnalyst] 跳过（未准备老项目工作区）"]
+        return updates
+
+    try:
+        from legacy import (
+            build_analyst_report,
+            collect_code_samples,
+            infer_touch_paths,
+            merge_llm_analysis,
+        )
+        from pathlib import Path
+
+        report = build_analyst_report(ws, req)
+        index_json = json.dumps(ws.get("index") or {}, ensure_ascii=False)[:4000]
+        samples = collect_code_samples(ws)
+        workspace_info = json.dumps(
+            {
+                "workspace_id": ws.get("workspace_id"),
+                "snapshot_path": ws.get("snapshot_path"),
+                "source_path": ws.get("source_path"),
+            },
+            ensure_ascii=False,
+        )
+
+        system = build_system("project_analyst")
+        user = build_user(
+            "project_analyst",
+            requirement=req,
+            workspace_info=workspace_info,
+            project_index=index_json,
+            code_samples=samples,
+        )
+        raw = _invoke_llm(system, user)
+        llm_data = _parse_json_from_llm(raw)
+        report = merge_llm_analysis(report, llm_data)
+        if llm_data.get("reusable_components"):
+            report["reusable_components"] = llm_data["reusable_components"]
+        if llm_data.get("code_style"):
+            report["code_style"] = {**(report.get("code_style") or {}), **llm_data["code_style"]}
+        if llm_data.get("constraints"):
+            report["constraints"] = list(dict.fromkeys((report.get("constraints") or []) + llm_data["constraints"]))
+
+        report_path = Path(report.get("report_path", ""))
+        if report_path.parent.exists():
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        updates["project_context_report"] = report
+        updates["legacy_analysis"] = ws.get("index") or {}
+        fe_touch = infer_touch_paths(req, report, ws.get("index") or {}, "frontend")
+        be_touch = infer_touch_paths(req, report, ws.get("index") or {}, "backend")
+        updates["touch_paths"] = {"frontend": fe_touch, "backend": be_touch}
+        reuse_n = len(report.get("reusable_components") or [])
+        updates.update(
+            _save_agent_output(
+                state,
+                "ProjectAnalyst",
+                {
+                    "summary": report.get("summary"),
+                    "reusable_count": reuse_n,
+                    "report_path": report.get("report_path"),
+                },
+            )
+        )
+        updates["logs"] = updates.get("logs", []) + [
+            f"[ProjectAnalyst] 报告已生成 · 可复用 {reuse_n} 项 · {report.get('report_path', '')}"
+        ]
+        logger.info("ProjectAnalyst ok reusable=%d", reuse_n)
+    except Exception as e:
+        logger.exception("ProjectAnalyst 失败")
+        updates["project_context_report"] = {"ok": False, "error": str(e)}
+        updates["errors"] = (state.get("errors") or []) + [str(e)]
+        updates["logs"] = updates.get("logs", []) + [f"[ProjectAnalyst] 异常: {e}"]
+    return updates
+
+
 def node_supervisor(state: DevState) -> dict:
-    """Supervisor: 任务拆分、API 契约、流程管控。"""
+    """Supervisor (Planner): 任务拆分、API 契约、流程管控。"""
     updates = _log(state, "Supervisor", "开始任务拆分与流程编排")
     req = state.get("requirement", "")
     legacy = state.get("legacy_path", "")
 
-    legacy_info = {}
-    if legacy:
+    project_ctx = _project_context_text(state)
+    legacy_info: dict = state.get("legacy_analysis") or {}
+    ws = state.get("legacy_workspace") or {}
+    if not legacy_info and ws.get("ok"):
+        legacy_info = ws.get("index") or {}
+    elif not legacy_info and legacy:
         legacy_info = scan_legacy_project(legacy)
-        updates["legacy_analysis"] = legacy_info
+
+    if legacy_info or state.get("project_context_report", {}).get("ok"):
+        updates["legacy_analysis"] = legacy_info if isinstance(legacy_info, dict) else {}
+        stack = legacy_info.get("stack", "?") if legacy_info else "?"
         updates["logs"] = updates.get("logs", []) + [
-            f"[Supervisor] 存量项目扫描: {legacy_info.get('file_count', 0)} 个文件, stack={legacy_info.get('stack_hint')}"
+            f"[Supervisor] 已读取 Project Analyst 报告 (stack={stack})"
         ]
 
     system = build_system("supervisor")
     user = build_user(
         "supervisor",
         requirement=req,
-        legacy_info=json.dumps(legacy_info, ensure_ascii=False)[:2000],
+        project_context=project_ctx,
     )
     raw = _invoke_llm(system, user)
     data = _parse_json_from_llm(raw)
@@ -774,14 +1030,31 @@ def node_backend_dev(state: DevState) -> dict:
     contract = state.get("api_contract", {})
     legacy = state.get("legacy_analysis", {})
 
+    legacy_ctx = _project_context_text(state)[:2500]
+    ws = state.get("legacy_workspace") or {}
+    stack = (ws.get("index") or {}).get("stack") or legacy.get("stack_hint", "python")
+    _, existing_block, touch_list = _dev_existing_files_context(state, "backend")
+
     system = build_system("backend")
     user = build_user(
         "backend",
         requirement=req,
         api_contract=json.dumps(contract, ensure_ascii=False),
-        stack_hint=legacy.get("stack_hint", "python"),
+        stack_hint=stack,
+        legacy_context=legacy_ctx or "（无）",
+        modify_mode=(
+            "存量改造：只改待改文件，输出完整内容"
+            if touch_list
+            else "可按需新建文件"
+        ),
+        existing_files=existing_block or "（无待改文件列表）",
     )
     files, code_source = _dev_llm_generate("BackendDev", system, user, req)
+    if touch_list:
+        files = _filter_dev_output(files, touch_list, "backend")
+        updates["logs"] = updates.get("logs", []) + [
+            f"[BackendDev] 存量改造，待改: {', '.join(touch_list)}"
+        ]
 
     updates.update(
         {
@@ -808,12 +1081,27 @@ def node_frontend_dev(state: DevState) -> dict:
     req = state.get("requirement", "")
 
     system = build_system("frontend")
+    legacy_ctx = _project_context_text(state)[:2500]
+    _, existing_block, touch_list = _dev_existing_files_context(state, "frontend")
+
     user = build_user(
         "frontend",
         api_contract=json.dumps(contract, ensure_ascii=False),
         requirement=req,
+        legacy_context=legacy_ctx or "（无）",
+        modify_mode=(
+            "存量改造：只改待改文件，输出完整内容"
+            if touch_list
+            else "可按需新建文件"
+        ),
+        existing_files=existing_block or "（无待改文件列表）",
     )
     files, code_source = _dev_llm_generate("FrontendDev", system, user, req)
+    if touch_list:
+        files = _filter_dev_output(files, touch_list, "frontend")
+        updates["logs"] = updates.get("logs", []) + [
+            f"[FrontendDev] 存量改造，待改: {', '.join(touch_list)}"
+        ]
 
     updates.update(
         {
@@ -1125,8 +1413,39 @@ def node_deliver(state: DevState) -> dict:
         analysis = state.get("legacy_analysis") or {}
         snap.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    merge_result: dict = {"ok": False, "skipped": True, "reason": "merge_disabled"}
-    if state.get("merge_enabled"):
+    merge_result: dict = {"ok": False, "skipped": True, "reason": "export_pending"}
+    export_pkg: dict = {}
+    ws = state.get("legacy_workspace") or {}
+    req = state.get("requirement", "")
+    legacy_target = (state.get("legacy_path") or cfg.DEFAULT_LEGACY_PATH).strip()
+
+    if ws.get("ok"):
+        try:
+            from legacy import build_export_package, export_to_legacy
+
+            export_pkg = build_export_package(out, ws, req, None)
+            updates["export_package"] = export_pkg
+            updates["logs"] = updates.get("logs", []) + [
+                f"[Deliver] 导出包（待确认）: {export_pkg.get('export_dir')}"
+            ]
+            if state.get("export_approved") and state.get("merge_enabled"):
+                merge_result = export_to_legacy(
+                    out,
+                    legacy_target,
+                    approved=True,
+                    backend_subdir=state.get("merge_backend_subdir"),
+                    frontend_subdir=state.get("merge_frontend_subdir"),
+                    conflict_mode=state.get("merge_conflict_mode"),
+                )
+                export_pkg.get("manifest", {})["status"] = "applied"
+            else:
+                updates["logs"] = updates.get("logs", []) + [
+                    "[Deliver] 未写回老项目原路径，请在界面确认「写入老项目」"
+                ]
+        except Exception as e:
+            logger.warning("导出包失败: %s", e)
+            updates["logs"] = updates.get("logs", []) + [f"[Deliver] 导出包异常: {e}"]
+    elif state.get("merge_enabled"):
         target = cfg.resolve_merge_target(state.get("merge_target", ""))
         merge_mode = state.get("merge_conflict_mode") or None
         merge_result = merge_to_project(
@@ -1159,7 +1478,7 @@ def node_deliver(state: DevState) -> dict:
             ]
             logger.warning("合并失败: %s", merge_result)
     else:
-        updates["logs"] = updates.get("logs", []) + ["[Deliver] 未启用合并到主项目"]
+        updates["logs"] = updates.get("logs", []) + ["[Deliver] 未启用写回主项目"]
 
     state_for_write["merge_result"] = merge_result
     memory_ingested = 0
@@ -1186,6 +1505,8 @@ def node_deliver(state: DevState) -> dict:
                 "delivered": True,
                 "merge": merge_result,
                 "memory_ingested": memory_ingested,
+                "export_package": export_pkg,
+                "legacy_path": legacy_target,
                 "output_dir": str(out),
             },
             ensure_ascii=False,
@@ -1197,6 +1518,7 @@ def node_deliver(state: DevState) -> dict:
     deliver_payload = {
         "path": str(out),
         "merge": merge_result,
+        "export_package": export_pkg,
         "memory_ingested": memory_ingested,
     }
     updates.update(
@@ -1291,6 +1613,8 @@ def build_pipeline():
 
     graph = StateGraph(DevState)
 
+    graph.add_node("prepare_workspace", _with_retry(node_prepare_workspace))
+    graph.add_node("project_analyst", _with_retry(node_project_analyst))
     graph.add_node("supervisor", _with_retry(node_supervisor))
     graph.add_node("backend_dev", _with_retry(node_backend_dev))
     graph.add_node("frontend_dev", _with_retry(node_frontend_dev))
@@ -1300,7 +1624,9 @@ def build_pipeline():
     graph.add_node("fix_loop", fix_sub)  # 子图嵌套
     graph.add_node("deliver", _with_retry(node_deliver))
 
-    graph.add_edge(START, "supervisor")
+    graph.add_edge(START, "prepare_workspace")
+    graph.add_edge("prepare_workspace", "project_analyst")
+    graph.add_edge("project_analyst", "supervisor")
     graph.add_conditional_edges("supervisor", route_parallel_dev, ["backend_dev", "frontend_dev"])
     graph.add_edge("backend_dev", "join")
     graph.add_edge("frontend_dev", "join")
@@ -1335,13 +1661,19 @@ def _build_initial_state(
     merge_backend_subdir: str = "",
     merge_frontend_subdir: str = "",
     merge_conflict_mode: str = "",
+    export_approved: bool = False,
 ) -> DevState:
     """构建流水线初始状态（含可配置合并目录）。"""
     enabled = cfg.MERGE_ENABLED if merge_enabled is None else merge_enabled
     mode = (merge_conflict_mode or "").strip().lower()
     return {
         "requirement": requirement.strip(),
-        "legacy_path": legacy_path.strip(),
+        "legacy_path": (legacy_path or cfg.DEFAULT_LEGACY_PATH).strip(),
+        "legacy_workspace": {},
+        "export_package": {},
+        "export_approved": export_approved,
+        "project_context_report": {},
+        "touch_paths": {},
         "output_dir": output_dir or str(cfg.DEFAULT_OUTPUT_DIR),
         "merge_target": (merge_target or cfg.MERGE_TARGET_ROOT).strip(),
         "merge_enabled": enabled,
@@ -1374,6 +1706,7 @@ def run_pipeline(
     merge_backend_subdir: str = "",
     merge_frontend_subdir: str = "",
     merge_conflict_mode: str = "",
+    export_approved: bool = False,
 ) -> DevState:
     """对外统一入口，供 CLI / Streamlit 调用。"""
     initial = _build_initial_state(
@@ -1462,7 +1795,9 @@ def get_mermaid_diagram() -> str:
     """生成流程图（Streamlit / 文档展示）。"""
     return """
 flowchart TD
-    START([开始]) --> SUP[Supervisor 任务拆分]
+    START([开始]) --> PW[PrepareWorkspace 隔离快照]
+    PW --> PA[Project Analyst 项目分析]
+    PA --> SUP[Supervisor Planner 任务拆分]
     SUP --> PAR{{并行扇出}}
     PAR --> BE[后端开发 Agent]
     PAR --> FE[前端开发 Agent]
@@ -1505,7 +1840,21 @@ if __name__ == "__main__":
         choices=["", "overwrite", "manual", "skip", "backup"],
         help="合并冲突策略（默认: MERGE_OVERWRITE=true 时为 overwrite）",
     )
+    parser.add_argument(
+        "--repair-nested-merge",
+        metavar="TARGET",
+        default="",
+        help="修复主项目中 backend/backend、frontend/frontend 嵌套（不上传新代码）",
+    )
     args = parser.parse_args()
+
+    if args.repair_nested_merge:
+        from legacy import repair_nested_merge_dirs
+
+        target = cfg.resolve_merge_target(args.repair_nested_merge or args.merge_target)
+        rep = repair_nested_merge_dirs(target)
+        print(json.dumps(rep, ensure_ascii=False, indent=2))
+        raise SystemExit(0 if rep.get("ok") else 1)
 
     if args.merge_run:
         mode = args.merge_mode or None

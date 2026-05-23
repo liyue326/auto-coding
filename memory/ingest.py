@@ -97,19 +97,19 @@ def ingest_successful_run(state: dict[str, Any], run_id: str = "") -> int:
         run_id = Path(str(state["output_dir"])).name
 
     experiences = state.get("fix_experiences") or []
-    # 只存「最终成功」那一轮修复（整次 run 测试已通过）
     if not experiences:
-        return 0
-    last_exp = experiences[-1]
-    if not isinstance(last_exp, dict):
         return 0
 
     added = 0
-    for exp in [last_exp]:
+    seen_ids: set[str] = set()
+    for exp in experiences:
         if not isinstance(exp, dict):
             continue
         round_n = exp.get("round", 0)
         case_id = f"{run_id}_r{round_n}"
+        if case_id in seen_ids:
+            continue
+        seen_ids.add(case_id)
         doc = _document_for_case(requirement, dev_scope, exp)
         meta = _metadata_for_case(run_id, requirement, dev_scope, exp)
         try:

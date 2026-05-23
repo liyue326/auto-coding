@@ -1,0 +1,467 @@
+{
+  "root": "/Users/liyue/Desktop/u/data/workspaces/all/source",
+  "stack": "python+vue",
+  "layout": {
+    "backend": "/Users/liyue/Desktop/u/data/workspaces/all/source/backend",
+    "frontend": "/Users/liyue/Desktop/u/data/workspaces/all/source/frontend"
+  },
+  "file_count": 32,
+  "files_sample": [
+    {
+      "path": "backend/schema.sql",
+      "ext": ".sql",
+      "size": 254
+    },
+    {
+      "path": "backend/schema 2.sql",
+      "ext": ".sql",
+      "size": 254
+    },
+    {
+      "path": "backend/tests/test_auth_service 2.py",
+      "ext": ".py",
+      "size": 366
+    },
+    {
+      "path": "backend/tests/test_api_contract 2.py",
+      "ext": ".py",
+      "size": 162
+    },
+    {
+      "path": "backend/tests/test_auth_service.py",
+      "ext": ".py",
+      "size": 366
+    },
+    {
+      "path": "backend/tests/test_api_contract.py",
+      "ext": ".py",
+      "size": 162
+    },
+    {
+      "path": "backend/backend/schema.sql",
+      "ext": ".sql",
+      "size": 314
+    },
+    {
+      "path": "backend/backend/tests/test_fib.py",
+      "ext": ".py",
+      "size": 562
+    },
+    {
+      "path": "backend/backend/tests/test_user_service.py",
+      "ext": ".py",
+      "size": 940
+    },
+    {
+      "path": "backend/backend/models/user.py",
+      "ext": ".py",
+      "size": 481
+    },
+    {
+      "path": "backend/backend/models/__init__.py",
+      "ext": ".py",
+      "size": 0
+    },
+    {
+      "path": "backend/backend/models/fib.py",
+      "ext": ".py",
+      "size": 90
+    },
+    {
+      "path": "backend/backend/api/routes.py",
+      "ext": ".py",
+      "size": 358
+    },
+    {
+      "path": "backend/backend/services/__init__.py",
+      "ext": ".py",
+      "size": 0
+    },
+    {
+      "path": "backend/backend/services/fib_service.py",
+      "ext": ".py",
+      "size": 461
+    },
+    {
+      "path": "backend/backend/services/user_service.py",
+      "ext": ".py",
+      "size": 419
+    },
+    {
+      "path": "backend/models/user.py",
+      "ext": ".py",
+      "size": 235
+    },
+    {
+      "path": "backend/models/health.py",
+      "ext": ".py",
+      "size": 121
+    },
+    {
+      "path": "backend/models/user 2.py",
+      "ext": ".py",
+      "size": 235
+    },
+    {
+      "path": "backend/api/routes 2.py",
+      "ext": ".py",
+      "size": 604
+    },
+    {
+      "path": "backend/api/routes.py",
+      "ext": ".py",
+      "size": 585
+    },
+    {
+      "path": "backend/services/auth_service.py",
+      "ext": ".py",
+      "size": 403
+    },
+    {
+      "path": "backend/services/auth_service 2.py",
+      "ext": ".py",
+      "size": 403
+    },
+    {
+      "path": "frontend/src/App.vue",
+      "ext": ".vue",
+      "size": 67
+    },
+    {
+      "path": "frontend/src/api/health.js",
+      "ext": ".js",
+      "size": 184
+    },
+    {
+      "path": "frontend/src/api/notes.js",
+      "ext": ".js",
+      "size": 499
+    },
+    {
+      "path": "frontend/src/api/auth.js",
+      "ext": ".js",
+      "size": 680
+    },
+    {
+      "path": "frontend/src/api/auth 2.js",
+      "ext": ".js",
+      "size": 680
+    },
+    {
+      "path": "frontend/src/views/LoginView.vue",
+      "ext": ".vue",
+      "size": 1387
+    },
+    {
+      "path": "frontend/src/views/HealthView.vue",
+      "ext": ".vue",
+      "size": 652
+    },
+    {
+      "path": "frontend/src/views/NotesView.vue",
+      "ext": ".vue",
+      "size": 4970
+    },
+    {
+      "path": "frontend/src/router/index.js",
+      "ext": ".js",
+      "size": 268
+    }
+  ],
+  "python_modules": [
+    {
+      "path": "backend/tests/test_auth_service 2.py",
+      "symbols": [
+        {
+          "kind": "function",
+          "name": "test_login_requires_password"
+        },
+        {
+          "kind": "function",
+          "name": "test_register_returns_user"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/tests/test_api_contract 2.py",
+      "symbols": [
+        {
+          "kind": "function",
+          "name": "test_routes_define_login"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/tests/test_auth_service.py",
+      "symbols": [
+        {
+          "kind": "function",
+          "name": "test_login_requires_password"
+        },
+        {
+          "kind": "function",
+          "name": "test_register_returns_user"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/tests/test_api_contract.py",
+      "symbols": [
+        {
+          "kind": "function",
+          "name": "test_routes_define_login"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/backend/tests/test_fib.py",
+      "symbols": [
+        {
+          "kind": "function",
+          "name": "test_calculate_fibonacci"
+        },
+        {
+          "kind": "function",
+          "name": "test_negative_n"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/backend/tests/test_user_service.py",
+      "symbols": [
+        {
+          "kind": "async_function",
+          "name": "test_delete_user_success"
+        },
+        {
+          "kind": "async_function",
+          "name": "test_delete_user_not_found"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/backend/models/user.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "User",
+          "methods": [
+            "__post_init__"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "__post_init__"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/backend/models/fib.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "FibResult",
+          "methods": []
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/backend/api/routes.py",
+      "symbols": [
+        {
+          "kind": "async_function",
+          "name": "delete_user_route"
+        }
+      ],
+      "routes": [
+        "POST /users/{user_id}/delete",
+        "PREFIX /api/v2"
+      ]
+    },
+    {
+      "path": "backend/backend/services/fib_service.py",
+      "symbols": [
+        {
+          "kind": "function",
+          "name": "calculate_fib"
+        },
+        {
+          "kind": "function",
+          "name": "save_fib_result"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/backend/services/user_service.py",
+      "symbols": [
+        {
+          "kind": "async_function",
+          "name": "delete_user"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/models/user.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "User",
+          "methods": []
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/models/health.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "HealthCheck",
+          "methods": []
+        },
+        {
+          "kind": "class",
+          "name": "Config",
+          "methods": []
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/models/user 2.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "User",
+          "methods": []
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/api/routes 2.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "RegisterBody",
+          "methods": []
+        },
+        {
+          "kind": "class",
+          "name": "LoginBody",
+          "methods": []
+        },
+        {
+          "kind": "function",
+          "name": "register"
+        },
+        {
+          "kind": "function",
+          "name": "login"
+        }
+      ],
+      "routes": [
+        "POST /register",
+        "POST /login",
+        "PREFIX /api/auth"
+      ]
+    },
+    {
+      "path": "backend/api/routes.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "RegisterBody",
+          "methods": []
+        },
+        {
+          "kind": "class",
+          "name": "LoginBody",
+          "methods": []
+        },
+        {
+          "kind": "function",
+          "name": "register"
+        },
+        {
+          "kind": "function",
+          "name": "login"
+        }
+      ],
+      "routes": [
+        "POST /register",
+        "POST /login",
+        "PREFIX /api/auth"
+      ]
+    },
+    {
+      "path": "backend/services/auth_service.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "AuthService",
+          "methods": [
+            "register",
+            "login"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "register"
+        },
+        {
+          "kind": "function",
+          "name": "login"
+        }
+      ],
+      "routes": []
+    },
+    {
+      "path": "backend/services/auth_service 2.py",
+      "symbols": [
+        {
+          "kind": "class",
+          "name": "AuthService",
+          "methods": [
+            "register",
+            "login"
+          ]
+        },
+        {
+          "kind": "function",
+          "name": "register"
+        },
+        {
+          "kind": "function",
+          "name": "login"
+        }
+      ],
+      "routes": []
+    }
+  ],
+  "api_routes": [
+    "POST /login",
+    "POST /register",
+    "POST /users/{user_id}/delete",
+    "PREFIX /api/auth",
+    "PREFIX /api/v2"
+  ],
+  "vue_routes": [
+    "/",
+    "/login"
+  ],
+  "dependencies": {
+    "python": [],
+    "node": []
+  }
+}

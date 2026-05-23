@@ -42,6 +42,15 @@ NODE_RETRY_ATTEMPTS: int = int(os.getenv("NODE_RETRY_ATTEMPTS", "2"))
 # 代码评审通过阈值（0-100）
 REVIEW_PASS_SCORE: int = int(os.getenv("REVIEW_PASS_SCORE", "75"))
 
+# ── 老项目（默认 Desktop/all）──────────────────────────────────────────
+DEFAULT_LEGACY_PATH: str = os.getenv(
+    "DEFAULT_LEGACY_PATH",
+    str(Path.home() / "Desktop" / "all"),
+).strip()
+WORKSPACES_DIR: Path = Path(
+    os.getenv("WORKSPACES_DIR", str(PROJECT_ROOT / "data" / "workspaces"))
+).expanduser()
+
 # ── 存量项目扫描 ────────────────────────────────────────────────────────
 LEGACY_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".vue",
@@ -58,7 +67,8 @@ MERGE_TARGET_ROOT: str = os.getenv(
 ).strip()
 MERGE_BACKEND_SUBDIR: str = os.getenv("MERGE_BACKEND_SUBDIR", "backend").strip()
 MERGE_FRONTEND_SUBDIR: str = os.getenv("MERGE_FRONTEND_SUBDIR", "frontend").strip()
-MERGE_ENABLED: bool = os.getenv("MERGE_ENABLED", "true").strip().lower() in (
+# 有 legacy_path 时默认不自动写回老项目，需人工确认（见 export_approved）
+MERGE_ENABLED: bool = os.getenv("MERGE_ENABLED", "false").strip().lower() in (
     "1",
     "true",
     "yes",
