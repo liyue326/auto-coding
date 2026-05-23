@@ -173,7 +173,7 @@ with st.sidebar:
         4. 代码评审 → 条件分支  
         5. 自动化测试  
         6. 有 BUG → **修复子图**（Chroma 检索历史成功案例）  
-        7. 通过后 **导出包** 交付；人工确认后才写回老项目  
+        7. 通过后生成导出包；在**主区域底部**点「确认写入老项目」才写回 Desktop  
         """
     )
 
@@ -372,6 +372,81 @@ if result:
         )
     elif merge and not merge.get("skipped"):
         st.warning(f"合并未成功: {merge.get('error', '未知原因')}")
+
+    # ── 人工确认写回老项目（默认不自动改原路径）────────────────────
+    export_pkg = result.get("export_package") or {}
+    legacy_target = (result.get("legacy_path") or legacy_path or cfg.DEFAULT_LEGACY_PATH).strip()
+    merge = result.get("merge_result") or {}
+    can_writeback = (
+        result.get("delivered")
+        and out
+        and legacy_target
+        and Path(out).exists()
+        and not merge.get("ok")
+    )
+    if can_writeback or export_pkg.get("ok"):
+        st.divider()
+        st.subheader("写回老项目（需人工确认）")
+        st.markdown(
+            "流水线只把新代码放在 `output/run_xxx` 和 `data/workspaces/.../export/`。"
+            "**不会**自动修改你 Desktop 上的老项目，避免误覆盖。"
+        )
+        if export_pkg.get("export_dir"):
+            files_dir = export_pkg.get("manifest", {}).get("files_dir") or export_pkg.get(
+                "export_dir"
+            )
+            st.caption(f"建议先审阅导出包: `{files_dir}`")
+        if merge.get("reason") == "export_pending" or export_pkg.get("ok"):
+            st.info("日志里的「未写回老项目原路径」表示在等待你在此确认。")
+
+        wb_target = st.text_input(
+            "写入目标（老项目根目录）",
+            value=legacy_target,
+            key="writeback_legacy_path",
+        )
+        wb_mode = st.selectbox(
+            "已存在文件策略",
+            options=["overwrite", "manual", "skip", "backup"],
+            index=0,
+            key="writeback_merge_mode",
+            format_func=lambda m: {
+                "overwrite": "覆盖",
+                "manual": "人工对比（不覆盖）",
+                "skip": "跳过已存在",
+                "backup": "先 .bak 再覆盖",
+            }.get(m, m),
+        )
+        st.caption(
+            f"将 `{out}/backend` → `{wb_target}/{result.get('merge_backend_subdir', cfg.MERGE_BACKEND_SUBDIR)}`，"
+            f"`{out}/frontend` → `{wb_target}/{result.get('merge_frontend_subdir', cfg.MERGE_FRONTEND_SUBDIR)}`"
+        )
+        if st.button("确认写入老项目", type="primary", key="btn_writeback_legacy"):
+            if not wb_target.strip():
+                st.error("请填写老项目路径")
+            else:
+                with st.spinner("正在写入老项目…"):
+                    try:
+                        from legacy import export_to_legacy
+
+                        m = export_to_legacy(
+                            Path(out),
+                            wb_target.strip(),
+                            approved=True,
+                            backend_subdir=result.get("merge_backend_subdir")
+                            or cfg.MERGE_BACKEND_SUBDIR,
+                            frontend_subdir=result.get("merge_frontend_subdir")
+                            or cfg.MERGE_FRONTEND_SUBDIR,
+                            conflict_mode=wb_mode,
+                        )
+                        result["merge_result"] = m
+                        st.session_state.last_result = result
+                        if m.get("ok"):
+                            st.success(f"已写入: {wb_target}")
+                        else:
+                            st.error(m.get("error", "写入失败"))
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
 
 else:
     st.info("填写需求后点击「启动流水线」。终端会打印各节点 DEBUG 日志。")
