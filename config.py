@@ -167,3 +167,67 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 # ── Streamlit ───────────────────────────────────────────────────────────
 STREAMLIT_PAGE_TITLE = "多智能体协作开发流水线"
 STREAMLIT_PAGE_ICON = "🤖"
+
+# ── MCP 集成（Playwright E2E / Context7+Fetch 文档 / SQL 校验）────────
+MCP_ENABLED: bool = os.getenv("MCP_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+MCP_TOOL_TIMEOUT_SEC: float = float(os.getenv("MCP_TOOL_TIMEOUT_SEC", "90"))
+MCP_DOCS_TIMEOUT_SEC: float = float(os.getenv("MCP_DOCS_TIMEOUT_SEC", "45"))
+MCP_E2E_TIMEOUT_SEC: float = float(os.getenv("MCP_E2E_TIMEOUT_SEC", "120"))
+MCP_SQL_TIMEOUT_SEC: float = float(os.getenv("MCP_SQL_TIMEOUT_SEC", "60"))
+MCP_DOCS_MAX_CHARS: int = int(os.getenv("MCP_DOCS_MAX_CHARS", "6000"))
+
+# Playwright MCP — E2E（需先启动前端 dev server，如 npm run dev）
+MCP_PLAYWRIGHT_ENABLED: bool = os.getenv(
+    "MCP_PLAYWRIGHT_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+MCP_PLAYWRIGHT_COMMAND: str = os.getenv("MCP_PLAYWRIGHT_COMMAND", "npx").strip()
+MCP_PLAYWRIGHT_ARGS: str = os.getenv(
+    "MCP_PLAYWRIGHT_ARGS", "-y,@playwright/mcp@latest"
+).strip()
+MCP_E2E_BASE_URL: str = os.getenv("MCP_E2E_BASE_URL", "").strip()
+MCP_E2E_STATIC_FALLBACK: bool = os.getenv(
+    "MCP_E2E_STATIC_FALLBACK", "true"
+).strip().lower() in ("1", "true", "yes")
+
+# Context7 + Fetch MCP — Dev/BugFix 框架文档
+MCP_DOCS_ENABLED: bool = os.getenv("MCP_DOCS_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+MCP_CONTEXT7_ENABLED: bool = os.getenv(
+    "MCP_CONTEXT7_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+MCP_CONTEXT7_COMMAND: str = os.getenv("MCP_CONTEXT7_COMMAND", "npx").strip()
+MCP_CONTEXT7_ARGS: str = os.getenv(
+    "MCP_CONTEXT7_ARGS", "-y,@upstash/context7-mcp@latest"
+).strip()
+CONTEXT7_API_KEY: str = os.getenv("CONTEXT7_API_KEY", "").strip()
+MCP_FETCH_ENABLED: bool = os.getenv("MCP_FETCH_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+MCP_FETCH_COMMAND: str = os.getenv("MCP_FETCH_COMMAND", "npx").strip()
+MCP_FETCH_ARGS: str = os.getenv(
+    "MCP_FETCH_ARGS", "-y,@modelcontextprotocol/server-fetch@latest"
+).strip()
+
+# SQL 校验 — 本地 SQLite + 可选 Postgres MCP
+MCP_SQL_ENABLED: bool = os.getenv("MCP_SQL_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+MCP_POSTGRES_ENABLED: bool = os.getenv(
+    "MCP_POSTGRES_ENABLED", "false"
+).strip().lower() in ("1", "true", "yes")
+MCP_POSTGRES_URI: str = os.getenv("MCP_POSTGRES_URI", "").strip()
+MCP_POSTGRES_COMMAND: str = os.getenv("MCP_POSTGRES_COMMAND", "npx").strip()
+MCP_POSTGRES_ARGS: str = os.getenv(
+    "MCP_POSTGRES_ARGS", "-y,@modelcontextprotocol/server-postgres@latest"
+).strip()

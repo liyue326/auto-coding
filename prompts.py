@@ -50,7 +50,7 @@ def build_system(agent: str) -> str:
 def build_user(agent: str, **ctx) -> str:
     """按角色组装 user prompt。"""
     tpl = _USER[agent]
-    defaults = {"conversation_history": "（无）"}
+    defaults = {"conversation_history": "（无）", "framework_docs": "（无）"}
     merged = {**defaults, **ctx}
     return tpl.format_map(
         {k: ("" if v is None else v) for k, v in merged.items()}
@@ -200,6 +200,9 @@ _USER = {
 ## 改造模式
 {modify_mode}
 
+## 框架文档（MCP Context7 / Fetch，编写时遵循）
+{framework_docs}
+
 ## 待修改已有文件（全文，必须在此基础上改）
 {existing_files}
 
@@ -218,6 +221,9 @@ _USER = {
 
 ## 改造模式
 {modify_mode}
+
+## 框架文档（MCP Context7 / Fetch，编写时遵循）
+{framework_docs}
 
 ## 待修改已有文件（全文，必须在此基础上改）
 {existing_files}
@@ -268,6 +274,9 @@ _USER = {
 
 ## 改造模式
 {modify_mode}
+
+## 框架文档（MCP）
+{framework_docs}
 
 ## 待修改已有文件（快照原文，必须保留原功能）
 {existing_files}

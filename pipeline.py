@@ -112,6 +112,7 @@ class DevState(TypedDict, total=False):
     delivered: bool
     force_deliver: bool
     code_changes: dict
+    mcp_results: dict
 
     # 可观测性
     logs: Annotated[list[str], _append_logs]
@@ -955,6 +956,36 @@ def _dev_existing_files_context(
         return {}, f"加载失败: {e}", []
 
 
+def _mcp_framework_docs(state: DevState, side: str) -> str:
+    """MCP Context7/Fetch：为 Dev/BugFix 拉取框架文档摘要。"""
+    if not cfg.MCP_ENABLED or not cfg.MCP_DOCS_ENABLED:
+        return "（MCP 文档检索未启用）"
+    try:
+        from mcp import fetch_framework_docs
+
+        block, _meta = fetch_framework_docs(
+            state.get("requirement", ""),
+            side,
+            state.get("dev_scope") or "fullstack",
+        )
+        return block
+    except Exception as e:
+        logger.warning("MCP 文档检索失败: %s", e)
+        return f"（MCP 文档检索失败: {e}）"
+
+
+def _mcp_framework_docs_combo(state: DevState) -> str:
+    """BugFix 全栈时合并前后端文档。"""
+    scope = state.get("dev_scope") or "fullstack"
+    if scope == "backend_only":
+        return _mcp_framework_docs(state, "backend")
+    if scope == "frontend_only":
+        return _mcp_framework_docs(state, "frontend")
+    be = _mcp_framework_docs(state, "backend")
+    fe = _mcp_framework_docs(state, "frontend")
+    return f"{be}\n\n{fe}"[: cfg.MCP_DOCS_MAX_CHARS * 2]
+
+
 def _filter_dev_output(
     files: dict[str, str], touch_paths: list[str], side: str
 ) -> dict[str, str]:
@@ -1222,6 +1253,7 @@ def node_backend_dev(state: DevState) -> dict:
             if touch_list
             else "可按需新建文件"
         ),
+        framework_docs=_mcp_framework_docs(state, "backend"),
         existing_files=existing_block or "（无待改文件列表）",
     )
     files, code_source = _dev_llm_generate("BackendDev", system, user, req)
@@ -1277,6 +1309,7 @@ def node_frontend_dev(state: DevState) -> dict:
             if touch_list
             else "可按需新建文件"
         ),
+        framework_docs=_mcp_framework_docs(state, "frontend"),
         existing_files=existing_block or "（无待改文件列表）",
     )
     files, code_source = _dev_llm_generate("FrontendDev", system, user, req)
@@ -1333,6 +1366,25 @@ def node_code_review(state: DevState) -> dict:
     if be_text and "password" in be_text.lower() and "hash" not in be_text.lower():
         issues.append({"severity": "high", "msg": "后端可能存在明文密码风险"})
         score -= 15
+
+    mcp_meta: dict = {}
+    if cfg.MCP_ENABLED and cfg.MCP_SQL_ENABLED and scope != "frontend_only":
+        try:
+            from mcp import validate_backend_schema
+
+            sql_issues, mcp_meta = validate_backend_schema(
+                backend, for_review=True
+            )
+            for item in sql_issues:
+                if isinstance(item, dict) and item.get("msg"):
+                    issues.append(item)
+                    sev = item.get("severity", "medium")
+                    if sev == "high":
+                        score -= 20
+                    elif sev == "medium":
+                        score -= 8
+        except Exception as e:
+            logger.warning("MCP SQL 评审跳过: %s", e)
 
     contract_str = json.dumps(contract, ensure_ascii=False)
     static_score = max(0, min(100, score))
@@ -1400,6 +1452,10 @@ def node_code_review(state: DevState) -> dict:
             "review_round": review_round,
             "review_dev_retries": dev_retries,
             **_save_agent_output(state, "CodeReview", result),
+            "mcp_results": {
+                **(state.get("mcp_results") or {}),
+                "sql_review": mcp_meta,
+            },
         }
     )
     logger.info("CodeReview 得分=%s 通过=%s", score, passed)
@@ -1465,6 +1521,40 @@ def node_test(state: DevState) -> dict:
         llm_test = _parse_json_from_llm(_invoke_llm(system, user))
 
     defects: list[dict] = _collect_test_defects(state, backend, frontend)
+    scope = state.get("dev_scope") or "fullstack"
+
+    mcp_report: dict = dict(state.get("mcp_results") or {})
+    if cfg.MCP_ENABLED and cfg.MCP_SQL_ENABLED and scope != "frontend_only":
+        try:
+            from mcp import validate_backend_schema
+
+            sql_defects, sql_meta = validate_backend_schema(backend)
+            defects.extend(sql_defects)
+            mcp_report["sql_test"] = sql_meta
+            if sql_defects:
+                updates["logs"] = updates.get("logs", []) + [
+                    f"[TestAgent] MCP SQL 校验发现 {len(sql_defects)} 个问题"
+                ]
+        except Exception as e:
+            logger.warning("MCP SQL 测试跳过: %s", e)
+
+    if cfg.MCP_ENABLED and cfg.MCP_PLAYWRIGHT_ENABLED and scope != "backend_only":
+        try:
+            from mcp import run_playwright_checks
+
+            e2e_defects, e2e_meta = run_playwright_checks(
+                state.get("requirement", ""),
+                frontend,
+            )
+            defects.extend(e2e_defects)
+            mcp_report["e2e"] = e2e_meta
+            mode = e2e_meta.get("mode") or e2e_meta.get("skipped") or "unknown"
+            updates["logs"] = updates.get("logs", []) + [
+                f"[TestAgent] MCP E2E ({mode}) 检出 {len(e2e_defects)} 个问题"
+            ]
+        except Exception as e:
+            logger.warning("MCP E2E 测试跳过: %s", e)
+
     for d in llm_test.get("defects") or []:
         if isinstance(d, dict) and d.get("desc"):
             defects.append(
@@ -1476,7 +1566,6 @@ def node_test(state: DevState) -> dict:
                 }
             )
 
-    scope = state.get("dev_scope") or "fullstack"
     if not defects:
         logger.info(
             "TestAgent 未检出缺陷 scope=%s backend=%s frontend=%s（故不进 BugFix）",
@@ -1501,6 +1590,7 @@ def node_test(state: DevState) -> dict:
         "failed": len(defects),
         "defects": defects,
         "test_files": list(test_files.keys()),
+        "mcp": mcp_report,
     }
 
     updates.update(
@@ -1508,6 +1598,7 @@ def node_test(state: DevState) -> dict:
             "test_result": result,
             "defects": defects,
             "test_passed": passed,
+            "mcp_results": mcp_report,
             **_save_agent_output(state, "TestAgent", result),
         }
     )
@@ -1557,6 +1648,7 @@ def node_bug_fix(state: DevState) -> dict:
         frontend_files=json.dumps({k: v[:3000] for k, v in frontend.items()}, ensure_ascii=False),
         fix_experience_hints=hints or "（暂无相似历史案例）",
         modify_mode="存量改造：在快照原文上修复缺陷，保留原有功能",
+        framework_docs=_mcp_framework_docs_combo(state),
         existing_files=existing_for_fix or "（无）",
     )
     from llm_schemas import DevFilesOutput

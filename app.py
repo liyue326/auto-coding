@@ -6,6 +6,7 @@ Streamlit 可视化操作界面
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import streamlit as st
@@ -218,6 +219,33 @@ with st.sidebar:
         st.caption(
             f"将合并到：`{merge_target}/{merge_be}` 与 `{merge_target}/{merge_fe}` · 策略 `{merge_mode}`"
         )
+
+    st.markdown("**MCP 增强**")
+    st.caption(f"总开关: **{'开' if cfg.MCP_ENABLED else '关'}**（`.env` 中 `MCP_ENABLED`）")
+    mcp_e2e_url = st.text_input(
+        "E2E 前端地址",
+        value=cfg.MCP_E2E_BASE_URL,
+        placeholder="http://localhost:5173",
+        help="配置后 TestAgent 用 Playwright MCP 打开页面；需先 npm run dev",
+    )
+    if mcp_e2e_url != cfg.MCP_E2E_BASE_URL:
+        st.caption("请在 .env 设置 MCP_E2E_BASE_URL 并重启 Streamlit 以持久生效")
+    st.caption(
+        f"文档 MCP: Context7={'开' if cfg.MCP_CONTEXT7_ENABLED else '关'} · "
+        f"Fetch={'开' if cfg.MCP_FETCH_ENABLED else '关'} · "
+        f"SQL={'开' if cfg.MCP_SQL_ENABLED else '关'} · "
+        f"Postgres={'开' if cfg.MCP_POSTGRES_ENABLED else '关'}"
+    )
+    if st.button("运行 MCP 自检", help="等同 python3 scripts/prepare_mcp.py"):
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve().parent / "scripts" / "prepare_mcp.py")],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parent),
+        )
+        st.code(proc.stdout or proc.stderr or "(无输出)")
 
     st.markdown("**多轮对话记忆**")
     conv_on = st.checkbox(
@@ -486,6 +514,11 @@ if result:
     if test:
         with st.expander("测试结果 / 缺陷清单"):
             st.json(test)
+
+    mcp_results = result.get("mcp_results") or (test or {}).get("mcp") or {}
+    if mcp_results:
+        with st.expander("MCP 检测（E2E / SQL）"):
+            st.json(mcp_results)
 
     render_code_changes(result)
     render_code_preview(result)
