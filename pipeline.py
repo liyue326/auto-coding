@@ -34,10 +34,21 @@ logger = logging.getLogger("multi-agent")
 # ═══════════════════════════════════════════════════════════════════════
 # 1. 全局状态结构体
 # ═══════════════════════════════════════════════════════════════════════
+_DICT_REPLACE = "__replace_dict__"
+
+
 def _merge_dicts(left: dict, right: dict) -> dict:
+    """并行节点合并；支持 __replace_dict__ 在一轮新需求开始时清空文件字典。"""
+    if right and right.get(_DICT_REPLACE):
+        return {k: v for k, v in right.items() if k != _DICT_REPLACE}
     merged = dict(left or {})
-    merged.update(right or {})
+    if right:
+        merged.update(right)
     return merged
+
+
+def _append_conversation_turns(left: list, right: list) -> list:
+    return (left or []) + (right or [])
 
 
 def _append_logs(left: list, right: list) -> list:
@@ -56,6 +67,13 @@ class DevState(TypedDict, total=False):
     legacy_workspace: dict
     project_context_report: dict
     touch_paths: dict  # {"backend": [...], "frontend": [...]}
+    conversation_thread_id: str
+    graph_thread_id: str
+    pipeline_step: int
+    review_dev_retries: int
+    conversation_turns: Annotated[list[dict], _append_conversation_turns]
+    conversation_history: list[dict]
+    conversation_context: str
     export_package: dict
     export_approved: bool
     output_dir: str
@@ -92,6 +110,7 @@ class DevState(TypedDict, total=False):
     review_passed: bool
     test_passed: bool
     delivered: bool
+    force_deliver: bool
 
     # 可观测性
     logs: Annotated[list[str], _append_logs]
@@ -102,14 +121,37 @@ class DevState(TypedDict, total=False):
 # ═══════════════════════════════════════════════════════════════════════
 # 2. 工具层（存量项目 / 输出 / LLM）
 # ═══════════════════════════════════════════════════════════════════════
-def _log(state: DevState, agent: str, msg: str, *, set_phase: bool = True) -> dict:
-    """并行节点勿写 phase，避免 LangGraph 并发更新冲突。"""
+def _log(
+    state: DevState,
+    agent: str,
+    msg: str,
+    *,
+    set_phase: bool = True,
+    count_step: bool | None = None,
+) -> dict:
+    """并行节点勿写 phase / pipeline_step，避免 LangGraph 并发更新冲突。"""
+    if count_step is None:
+        count_step = set_phase
     line = f"[{agent}] {msg}"
     logger.info(line)
     out: dict = {"logs": [line]}
+    if count_step:
+        out["pipeline_step"] = (state.get("pipeline_step") or 0) + 1
     if set_phase:
         out["phase"] = agent
     return out
+
+
+def _pipeline_over_step_limit(state: DevState) -> bool:
+    return (state.get("pipeline_step") or 0) >= cfg.MAX_PIPELINE_STEPS
+
+
+def _force_deliver_route(state: DevState, reason: str) -> dict:
+    """步数超限时写入日志字段，供路由函数强制结束。"""
+    return {
+        "logs": [f"[Guard] {reason}（已达 MAX_PIPELINE_STEPS={cfg.MAX_PIPELINE_STEPS}）"],
+        "force_deliver": True,
+    }
 
 
 def _save_agent_output(state: DevState, agent: str, payload: Any) -> dict:
@@ -496,12 +538,37 @@ def _get_chat_llm():
     )
 
 
-def _invoke_llm(system: str, user: str, on_token: Any = None) -> str:
+def _invoke_llm(
+    system: str,
+    user: str,
+    on_token: Any = None,
+    *,
+    schema: type | None = None,
+) -> str:
+    """调用 LLM；schema 非空且开启结构化输出时走 Function Calling / JSON Schema。"""
     if cfg.USE_MOCK_LLM:
         text = _mock_llm_response(system, user)
         if on_token:
             on_token(text)
         return text
+
+    if schema and cfg.USE_STRUCTURED_OUTPUT and not on_token:
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            llm = _get_chat_llm()
+            method = cfg.STRUCTURED_OUTPUT_METHOD
+            if method not in ("function_calling", "json_schema", "json_mode"):
+                method = "function_calling"
+            structured = llm.with_structured_output(schema, method=method)
+            messages = [SystemMessage(content=system), HumanMessage(content=user)]
+            parsed = structured.invoke(messages)
+            if hasattr(parsed, "model_dump"):
+                return json.dumps(parsed.model_dump(), ensure_ascii=False)
+            return json.dumps(parsed, ensure_ascii=False)
+        except Exception as e:
+            logger.warning("结构化输出失败，回退普通 JSON 文本: %s", e)
+
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -523,6 +590,13 @@ def _invoke_llm(system: str, user: str, on_token: Any = None) -> str:
             logger.warning("Mock 模式已开启，回退本地模板")
             return _mock_llm_response(system, user)
         raise
+
+
+def _invoke_structured(system: str, user: str, schema: type) -> dict:
+    """结构化调用，返回 dict（解析失败则 {}）。"""
+    raw = _invoke_llm(system, user, schema=schema)
+    data = _parse_json_from_llm(raw)
+    return data if isinstance(data, dict) else {}
 
 
 def _requirement_from_prompt(user: str) -> str:
@@ -587,6 +661,14 @@ def _mock_llm_response(system: str, user: str) -> str:
             ensure_ascii=False,
         )
     if role == "frontend":
+        from legacy import apply_requirement_on_baseline, parse_existing_files_from_prompt
+
+        baselines = parse_existing_files_from_prompt(user)
+        if baselines:
+            out_files = {}
+            for path, content in baselines.items():
+                out_files[path] = apply_requirement_on_baseline(content, req, path)
+            return json.dumps({"files": out_files}, ensure_ascii=False)
         safe = req.replace('"', "'")[:120]
         return json.dumps(
             {
@@ -594,7 +676,7 @@ def _mock_llm_response(system: str, user: str) -> str:
                     "src/App.vue": (
                         "<template><main class=\"page\"><h1>{{ title }}</h1></main></template>\n"
                         f"<script setup>\nconst title = \"{safe}\";\n</script>\n"
-                        "<style scoped>.page { padding: 2rem; }</style>\n"
+                        "<style scoped>.page {{ padding: 2rem; }}</style>\n"
                     ),
                 }
             },
@@ -608,6 +690,18 @@ def _mock_llm_response(system: str, user: str) -> str:
             ensure_ascii=False,
         )
     if role == "bug_fix":
+        from legacy import apply_requirement_on_baseline, parse_existing_files_from_prompt
+
+        baselines = parse_existing_files_from_prompt(user)
+        if baselines:
+            out_files = {}
+            for path, content in baselines.items():
+                out_files[path] = apply_requirement_on_baseline(content, req, path)
+            if "api/routes.py" in str(user) and "api/routes.py" not in out_files:
+                out_files["api/routes.py"] = (
+                    '# patched logout\n@router.post("/logout")\nasync def logout():\n    return {"ok": True}\n'
+                )
+            return json.dumps({"files": out_files}, ensure_ascii=False)
         return json.dumps({"files": {}}, ensure_ascii=False)
     return "MOCK_OK"
 
@@ -657,6 +751,14 @@ def _dev_llm_generate(
     user: str,
     requirement: str,
 ) -> tuple[dict[str, str], str]:
+    from llm_schemas import DevFilesOutput
+
+    if cfg.USE_STRUCTURED_OUTPUT:
+        data = _invoke_structured(system, user, DevFilesOutput)
+        files = data.get("files") if isinstance(data.get("files"), dict) else {}
+        if files:
+            logger.info("%s 结构化输出 %d 个文件", agent, len(files))
+            return files, "structured"
     raw = _invoke_llm(system, user)
     parsed = _parse_files_from_llm(raw)
     if parsed:
@@ -744,13 +846,47 @@ def _with_retry(fn, attempts: int | None = None):
     return wrapped
 
 
+def node_reset_run(state: DevState) -> dict:
+    """新需求开始：清空上一轮产物，保留 Checkpoint 中的 conversation_turns。"""
+    updates = _log(state, "ResetRun", "新需求：清空上一轮流水线产物", set_phase=False)
+    empty_marker = {_DICT_REPLACE: True}
+    updates.update(
+        {
+            "backend_files": empty_marker,
+            "frontend_files": empty_marker,
+            "defects": [],
+            "fix_round": 0,
+            "review_round": 0,
+            "review_dev_retries": 0,
+            "pipeline_step": 0,
+            "force_deliver": False,
+            "fix_experiences": [],
+            "memory_retrieved": [],
+            "delivered": False,
+            "test_passed": False,
+            "review_passed": False,
+            "review_result": {},
+            "test_result": {},
+            "merge_result": {},
+            "export_package": {},
+            "agent_outputs": empty_marker,
+        }
+    )
+    return updates
+
+
 def node_prepare_workspace(state: DevState) -> dict:
     """隔离导入老项目：复制快照 + 索引（绝不修改原目录）。"""
     legacy = (state.get("legacy_path") or cfg.DEFAULT_LEGACY_PATH).strip()
     if not legacy:
-        return _log(state, "PrepareWorkspace", "未配置老项目路径，跳过", set_phase=False)
+        return _log(state, "PrepareWorkspace", "未配置老项目路径，跳过", set_phase=False, count_step=True)
 
-    updates = _log(state, "PrepareWorkspace", f"准备老项目工作区: {legacy}", set_phase=False)
+    existing = state.get("legacy_workspace") or {}
+    src = str(Path(legacy).expanduser().resolve())
+    if existing.get("ok") and existing.get("source_path") == src:
+        return _log(state, "PrepareWorkspace", "工作区已就绪，跳过重复准备", set_phase=False, count_step=True)
+
+    updates = _log(state, "PrepareWorkspace", f"准备老项目工作区: {legacy}", set_phase=False, count_step=True)
     try:
         from legacy import format_legacy_context, prepare_legacy_workspace
 
@@ -759,8 +895,9 @@ def node_prepare_workspace(state: DevState) -> dict:
         updates["legacy_path"] = legacy
         if ws.get("ok"):
             idx = ws.get("index") or {}
+            skip = "（复用缓存）" if ws.get("skipped_copy") else ""
             updates["logs"] = updates.get("logs", []) + [
-                f"[PrepareWorkspace] 快照 {ws.get('snapshot_path')} · "
+                f"[PrepareWorkspace] 快照 {ws.get('snapshot_path')}{skip} · "
                 f"索引 {idx.get('file_count', 0)} 个文件 · stack={idx.get('stack')}"
             ]
         else:
@@ -846,6 +983,21 @@ def _filter_dev_output(
     return files
 
 
+def _conversation_context_text(state: DevState) -> str:
+    ctx = (state.get("conversation_context") or "").strip()
+    if ctx:
+        return ctx
+    if cfg.CONVERSATION_MEMORY_ENABLED:
+        try:
+            from memory import format_for_prompt
+
+            hist = state.get("conversation_history") or []
+            return format_for_prompt(hist, current_requirement=state.get("requirement", ""))
+        except Exception:
+            pass
+    return "（无历史对话）"
+
+
 def _project_context_text(state: DevState) -> str:
     """Supervisor / Dev 使用的项目上下文文本。"""
     req = state.get("requirement", "")
@@ -884,6 +1036,12 @@ def node_project_analyst(state: DevState) -> dict:
         updates["logs"] = updates.get("logs", []) + ["[ProjectAnalyst] 跳过（未准备老项目工作区）"]
         return updates
 
+    prior = state.get("project_context_report") or {}
+    if prior.get("ok") and prior.get("source_path") == ws.get("source_path"):
+        updates["project_context_report"] = prior
+        updates["logs"] = updates.get("logs", []) + ["[ProjectAnalyst] 复用已有报告，跳过重复分析"]
+        return updates
+
     try:
         from legacy import (
             build_analyst_report,
@@ -906,15 +1064,20 @@ def node_project_analyst(state: DevState) -> dict:
         )
 
         system = build_system("project_analyst")
+        conv = _conversation_context_text(state)
         user = build_user(
             "project_analyst",
             requirement=req,
+            conversation_history=conv,
             workspace_info=workspace_info,
             project_index=index_json,
             code_samples=samples,
         )
-        raw = _invoke_llm(system, user)
-        llm_data = _parse_json_from_llm(raw)
+        from llm_schemas import ProjectAnalystReport
+
+        llm_data = _invoke_structured(system, user, ProjectAnalystReport)
+        if not llm_data:
+            llm_data = _parse_json_from_llm(_invoke_llm(system, user))
         report = merge_llm_analysis(report, llm_data)
         if llm_data.get("reusable_components"):
             report["reusable_components"] = llm_data["reusable_components"]
@@ -978,13 +1141,23 @@ def node_supervisor(state: DevState) -> dict:
         ]
 
     system = build_system("supervisor")
+    conv = _conversation_context_text(state)
+    hist_n = len(state.get("conversation_history") or [])
+    if hist_n:
+        updates["logs"] = updates.get("logs", []) + [
+            f"[Supervisor] 已加载多轮对话记忆 {hist_n} 轮"
+        ]
     user = build_user(
         "supervisor",
         requirement=req,
+        conversation_history=conv,
         project_context=project_ctx,
     )
-    raw = _invoke_llm(system, user)
-    data = _parse_json_from_llm(raw)
+    from llm_schemas import SupervisorPlan
+
+    data = _invoke_structured(system, user, SupervisorPlan)
+    if not data:
+        data = _parse_json_from_llm(_invoke_llm(system, user))
 
     tasks = data.get("tasks") or []
     dev_scope = _resolve_dev_scope(req, tasks, data)
@@ -1025,7 +1198,7 @@ def node_supervisor(state: DevState) -> dict:
 
 def node_backend_dev(state: DevState) -> dict:
     """后端开发 Agent: 按需求生成代码（无写死模板）。"""
-    updates = _log(state, "BackendDev", "开始后端开发", set_phase=False)
+    updates = _log(state, "BackendDev", "开始后端开发", set_phase=False, count_step=False)
     req = state.get("requirement", "")
     contract = state.get("api_contract", {})
     legacy = state.get("legacy_analysis", {})
@@ -1033,12 +1206,13 @@ def node_backend_dev(state: DevState) -> dict:
     legacy_ctx = _project_context_text(state)[:2500]
     ws = state.get("legacy_workspace") or {}
     stack = (ws.get("index") or {}).get("stack") or legacy.get("stack_hint", "python")
-    _, existing_block, touch_list = _dev_existing_files_context(state, "backend")
+    baseline_map, existing_block, touch_list = _dev_existing_files_context(state, "backend")
 
     system = build_system("backend")
     user = build_user(
         "backend",
         requirement=req,
+        conversation_history=_conversation_context_text(state),
         api_contract=json.dumps(contract, ensure_ascii=False),
         stack_hint=stack,
         legacy_context=legacy_ctx or "（无）",
@@ -1052,6 +1226,13 @@ def node_backend_dev(state: DevState) -> dict:
     files, code_source = _dev_llm_generate("BackendDev", system, user, req)
     if touch_list:
         files = _filter_dev_output(files, touch_list, "backend")
+    if baseline_map:
+        from legacy import coalesce_with_baseline
+
+        files, co_notes = coalesce_with_baseline(files, baseline_map, req)
+        for n in co_notes:
+            updates["logs"] = updates.get("logs", []) + [f"[BackendDev] {n}"]
+    if touch_list:
         updates["logs"] = updates.get("logs", []) + [
             f"[BackendDev] 存量改造，待改: {', '.join(touch_list)}"
         ]
@@ -1076,18 +1257,19 @@ def node_backend_dev(state: DevState) -> dict:
 
 def node_frontend_dev(state: DevState) -> dict:
     """前端开发 Agent: 按需求生成代码（无写死模板）。"""
-    updates = _log(state, "FrontendDev", "开始前端开发", set_phase=False)
+    updates = _log(state, "FrontendDev", "开始前端开发", set_phase=False, count_step=False)
     contract = state.get("api_contract", {})
     req = state.get("requirement", "")
 
     system = build_system("frontend")
     legacy_ctx = _project_context_text(state)[:2500]
-    _, existing_block, touch_list = _dev_existing_files_context(state, "frontend")
+    baseline_map, existing_block, touch_list = _dev_existing_files_context(state, "frontend")
 
     user = build_user(
         "frontend",
         api_contract=json.dumps(contract, ensure_ascii=False),
         requirement=req,
+        conversation_history=_conversation_context_text(state),
         legacy_context=legacy_ctx or "（无）",
         modify_mode=(
             "存量改造：只改待改文件，输出完整内容"
@@ -1099,6 +1281,13 @@ def node_frontend_dev(state: DevState) -> dict:
     files, code_source = _dev_llm_generate("FrontendDev", system, user, req)
     if touch_list:
         files = _filter_dev_output(files, touch_list, "frontend")
+    if baseline_map:
+        from legacy import coalesce_with_baseline
+
+        files, co_notes = coalesce_with_baseline(files, baseline_map, req)
+        for n in co_notes:
+            updates["logs"] = updates.get("logs", []) + [f"[FrontendDev] {n}"]
+    if touch_list:
         updates["logs"] = updates.get("logs", []) + [
             f"[FrontendDev] 存量改造，待改: {', '.join(touch_list)}"
         ]
@@ -1157,9 +1346,15 @@ def node_code_review(state: DevState) -> dict:
         frontend_files=list(frontend.keys()),
         api_contract=contract_str[:1500],
     )
-    raw = _invoke_llm(system, user)
-    llm_review = _parse_json_from_llm(raw)
-    logger.info("CodeReview LLM 原始回复前200字: %s", (raw or "")[:200])
+    from llm_schemas import ReviewOutput
+
+    llm_review = _invoke_structured(system, user, ReviewOutput)
+    if not llm_review:
+        raw = _invoke_llm(system, user)
+        llm_review = _parse_json_from_llm(raw)
+        logger.info("CodeReview LLM 原始回复前200字: %s", (raw or "")[:200])
+    else:
+        logger.info("CodeReview 结构化输出 score=%s", llm_review.get("score"))
 
     # 静态分保底，LLM 分加权合并，避免 LLM 返回 0 覆盖合理静态分
     score = static_score
@@ -1194,11 +1389,15 @@ def node_code_review(state: DevState) -> dict:
         "passed": passed,
         "round": review_round,
     }
+    dev_retries = state.get("review_dev_retries") or 0
+    if not passed:
+        dev_retries += 1
     updates.update(
         {
             "review_result": result,
             "review_passed": passed,
             "review_round": review_round,
+            "review_dev_retries": dev_retries,
             **_save_agent_output(state, "CodeReview", result),
         }
     )
@@ -1258,8 +1457,11 @@ def node_test(state: DevState) -> dict:
         frontend_files=list(frontend.keys()),
         api_contract=json.dumps(state.get("api_contract") or {}, ensure_ascii=False)[:1500],
     )
-    raw = _invoke_llm(system, user)
-    llm_test = _parse_json_from_llm(raw)
+    from llm_schemas import TestOutput
+
+    llm_test = _invoke_structured(system, user, TestOutput)
+    if not llm_test:
+        llm_test = _parse_json_from_llm(_invoke_llm(system, user))
 
     defects: list[dict] = _collect_test_defects(state, backend, frontend)
     for d in llm_test.get("defects") or []:
@@ -1285,6 +1487,13 @@ def node_test(state: DevState) -> dict:
         logger.info("TestAgent 检出缺陷 %d 条: %s", len(defects), [d.get("id") for d in defects])
 
     passed = len(defects) == 0
+    fix_round = state.get("fix_round") or 0
+    if not passed and fix_round >= cfg.MAX_FIX_ROUNDS:
+        logger.warning(
+            "TestAgent: 已达 MAX_FIX_ROUNDS=%s，强制结束测试循环",
+            cfg.MAX_FIX_ROUNDS,
+        )
+        passed = True
     result = {
         "passed": passed,
         "cases_run": len(test_files),
@@ -1332,23 +1541,57 @@ def node_bug_fix(state: DevState) -> dict:
     except Exception as e:
         logger.warning("修复经验检索跳过: %s", e)
 
+    fe_base, fe_block, fe_touch = _dev_existing_files_context(state, "frontend")
+    be_base, be_block, be_touch = _dev_existing_files_context(state, "backend")
+    existing_for_fix = fe_block if fe_block and not fe_block.startswith("（无") else ""
+    if be_block and not be_block.startswith("（无"):
+        existing_for_fix = (existing_for_fix + "\n\n" + be_block).strip()
+
     system = build_system("bug_fix")
     user = build_user(
         "bug_fix",
         defects=json.dumps(defects, ensure_ascii=False),
+        conversation_history=_conversation_context_text(state),
         backend_files=json.dumps({k: v[:3000] for k, v in backend.items()}, ensure_ascii=False),
         frontend_files=json.dumps({k: v[:3000] for k, v in frontend.items()}, ensure_ascii=False),
         fix_experience_hints=hints or "（暂无相似历史案例）",
+        modify_mode="存量改造：在快照原文上修复缺陷，保留原有功能",
+        existing_files=existing_for_fix or "（无）",
     )
-    raw = _invoke_llm(system, user)
-    patched = _parse_files_from_llm(raw)
-    fix_action = "llm_patched" if patched else "rule_fallback"
+    from llm_schemas import DevFilesOutput
+
+    patched: dict[str, str] = {}
+    if cfg.USE_STRUCTURED_OUTPUT:
+        data = _invoke_structured(system, user, DevFilesOutput)
+        if isinstance(data.get("files"), dict):
+            patched = data["files"]
+    if not patched:
+        patched = _parse_files_from_llm(_invoke_llm(system, user))
+    fix_action = "structured" if patched and cfg.USE_STRUCTURED_OUTPUT else (
+        "llm_patched" if patched else "rule_fallback"
+    )
     if patched:
+        fe_patch: dict[str, str] = {}
+        be_patch: dict[str, str] = {}
         for path, content in patched.items():
             if path.startswith("src/") or path.endswith(".vue") or path.endswith(".js"):
-                frontend[path] = content
+                fe_patch[path] = content
             else:
-                backend[path] = content
+                be_patch[path] = content
+        if fe_base:
+            from legacy import coalesce_with_baseline
+
+            fe_patch, notes = coalesce_with_baseline(fe_patch, fe_base, req)
+            for n in notes:
+                updates["logs"] = updates.get("logs", []) + [f"[BugFix] {n}"]
+        if be_base:
+            from legacy import coalesce_with_baseline
+
+            be_patch, notes = coalesce_with_baseline(be_patch, be_base, req)
+            for n in notes:
+                updates["logs"] = updates.get("logs", []) + [f"[BugFix] {n}"]
+        frontend.update(fe_patch)
+        backend.update(be_patch)
     else:
         for d in defects:
             if d.get("module") == "frontend" and "password" in d.get("desc", "").lower():
@@ -1400,7 +1643,12 @@ def node_bug_fix(state: DevState) -> dict:
 
 def node_deliver(state: DevState) -> dict:
     """交付节点: 落盘输出，不覆盖存量原目录。"""
-    updates = _log(state, "Deliver", "项目交付，写入独立输出目录")
+    step_count = len(state.get("logs") or [])
+    updates = _log(
+        state,
+        "Deliver",
+        f"项目交付（本次流水线约 {step_count} 条节点日志，非对话记忆轮数）",
+    )
     out = _ensure_output_dir(state)
     state_for_write = dict(state)
     state_for_write["output_dir"] = str(out)
@@ -1487,13 +1735,43 @@ def node_deliver(state: DevState) -> dict:
         from memory.store import collection_count
 
         final_state = {**state, **updates, "merge_result": merge_result}
+        from memory import ingest_skip_reason
+
         memory_ingested = ingest_successful_run(final_state, run_id=out.name)
         if memory_ingested:
             updates["logs"] = updates.get("logs", []) + [
-                f"[Deliver] 已入库 {memory_ingested} 条成功修复经验（库内共约 {collection_count()} 条）"
+                f"[Deliver] 已入库 {memory_ingested} 条修复经验（库内共 {collection_count()} 条）"
             ]
+        else:
+            reason = ingest_skip_reason(final_state)
+            if reason:
+                updates["logs"] = updates.get("logs", []) + [
+                    f"[Deliver] 修复经验未入库: {reason}"
+                ]
     except Exception as e:
         logger.warning("修复经验入库跳过: %s", e)
+
+    if cfg.CONVERSATION_MEMORY_ENABLED:
+        try:
+            from memory import append_turn, build_turn_from_state
+
+            tid = state.get("conversation_thread_id") or cfg.CONVERSATION_DEFAULT_THREAD
+            turn = build_turn_from_state({**state, **updates}, tid)
+            prev_turns = list(state.get("conversation_turns") or [])
+            all_turns = prev_turns + [turn]
+            updates["conversation_turns"] = [turn]
+            updates["conversation_history"] = all_turns
+            storage = []
+            if cfg.CONVERSATION_USE_CHECKPOINT and cfg.LANGGRAPH_CHECKPOINT_ENABLED:
+                storage.append("LangGraph Checkpoint")
+            if cfg.CONVERSATION_USE_JSONL:
+                append_turn(tid, turn)
+                storage.append("JSONL")
+            updates["logs"] = updates.get("logs", []) + [
+                f"[Deliver] 对话记忆已保存（{', '.join(storage) or '无'} · 线程 {tid} · 共 {len(all_turns)} 轮）"
+            ]
+        except Exception as e:
+            logger.warning("对话记忆保存失败: %s", e)
 
     (out / "reports" / "summary.json").write_text(
         json.dumps(
@@ -1502,6 +1780,9 @@ def node_deliver(state: DevState) -> dict:
                 "review": state.get("review_result"),
                 "test": state.get("test_result"),
                 "defects": state.get("defects"),
+                "fix_experiences": state.get("fix_experiences") or [],
+                "fix_round": state.get("fix_round", 0),
+                "test_passed": state.get("test_passed"),
                 "delivered": True,
                 "merge": merge_result,
                 "memory_ingested": memory_ingested,
@@ -1555,20 +1836,35 @@ def route_parallel_dev(state: DevState) -> list[Send]:
     return sends
 
 
-def route_after_review(state: DevState) -> Literal["test", "parallel_dev", "deliver"]:
-    """评审后条件分支: 通过→测试; 不通过且未超重试→回开发; 否则强制进入测试。"""
+def route_after_review(
+    state: DevState,
+) -> Literal["test", "frontend_dev", "backend_dev", "supervisor", "deliver"]:
+    """评审后条件分支: 通过→测试; 不通过→直接回对应 Dev（不重头 Prepare）。"""
+    if state.get("force_deliver") or _pipeline_over_step_limit(state):
+        logger.error("路由: 强制 Deliver（步数上限或 guard）")
+        return "deliver"
     if state.get("review_passed"):
         return "test"
-    review_round = state.get("review_round") or 0
-    if review_round < cfg.MAX_REVIEW_RETRIES:
-        logger.info("路由: 评审未通过，回退并行开发 (round=%s)", review_round)
-        return "parallel_dev"
+    dev_retries = state.get("review_dev_retries") or 0
+    if dev_retries < cfg.MAX_REVIEW_RETRIES:
+        scope = state.get("dev_scope") or "fullstack"
+        if scope == "frontend_only":
+            logger.info("路由: 评审未通过，回退 FrontendDev (retry=%s)", dev_retries)
+            return "frontend_dev"
+        if scope == "backend_only":
+            logger.info("路由: 评审未通过，回退 BackendDev (retry=%s)", dev_retries)
+            return "backend_dev"
+        logger.info("路由: 评审未通过，回退 Supervisor 编排 (retry=%s)", dev_retries)
+        return "supervisor"
     logger.warning("路由: 评审未通过但已达最大重试，进入测试")
     return "test"
 
 
 def route_after_test(state: DevState) -> Literal["bug_fix", "deliver"]:
     """测试后: 有缺陷且未超重试→修复子图; 否则交付。"""
+    if state.get("force_deliver") or _pipeline_over_step_limit(state):
+        logger.error("路由: 测试后强制 Deliver（步数上限）")
+        return "deliver"
     if state.get("test_passed"):
         logger.info("路由: 测试通过，进入 Deliver（无 BugFix）")
         return "deliver"
@@ -1586,20 +1882,6 @@ def route_after_test(state: DevState) -> Literal["bug_fix", "deliver"]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 5. 子图: 缺陷修复 → 复测 循环
-# ═══════════════════════════════════════════════════════════════════════
-def build_fix_subgraph() -> StateGraph:
-    """嵌套子图: 修复 → 测试（循环体在父图条件边控制）。"""
-    sg = StateGraph(DevState)
-    sg.add_node("bug_fix", _with_retry(node_bug_fix))
-    sg.add_node("retest", _with_retry(node_test))
-    sg.add_edge(START, "bug_fix")
-    sg.add_edge("bug_fix", "retest")
-    sg.add_edge("retest", END)
-    return sg.compile()
-
-
-# ═══════════════════════════════════════════════════════════════════════
 # 6. 主图装配
 # ═══════════════════════════════════════════════════════════════════════
 def build_pipeline():
@@ -1607,12 +1889,13 @@ def build_pipeline():
     主流水线:
     START → supervisor → [并行] backend_dev + frontend_dev
          → join → code_review → (条件) test / 回开发
-         → (条件) fix_subgraph / deliver → END
+         → (条件) bug_fix 循环 / deliver → END
     """
-    fix_sub = build_fix_subgraph()
+    checkpointer = get_checkpointer() if cfg.LANGGRAPH_CHECKPOINT_ENABLED else None
 
     graph = StateGraph(DevState)
 
+    graph.add_node("reset_run", _with_retry(node_reset_run))
     graph.add_node("prepare_workspace", _with_retry(node_prepare_workspace))
     graph.add_node("project_analyst", _with_retry(node_project_analyst))
     graph.add_node("supervisor", _with_retry(node_supervisor))
@@ -1621,10 +1904,11 @@ def build_pipeline():
     graph.add_node("join", lambda s: _log(s, "Join", "并行开发完成，汇合进入评审"))
     graph.add_node("code_review", _with_retry(node_code_review))
     graph.add_node("test", _with_retry(node_test))
-    graph.add_node("fix_loop", fix_sub)  # 子图嵌套
+    graph.add_node("bug_fix", _with_retry(node_bug_fix))
     graph.add_node("deliver", _with_retry(node_deliver))
 
-    graph.add_edge(START, "prepare_workspace")
+    graph.add_edge(START, "reset_run")
+    graph.add_edge("reset_run", "prepare_workspace")
     graph.add_edge("prepare_workspace", "project_analyst")
     graph.add_edge("project_analyst", "supervisor")
     graph.add_conditional_edges("supervisor", route_parallel_dev, ["backend_dev", "frontend_dev"])
@@ -1635,17 +1919,58 @@ def build_pipeline():
     graph.add_conditional_edges(
         "code_review",
         route_after_review,
-        {"test": "test", "parallel_dev": "supervisor", "deliver": "deliver"},
+        {
+            "test": "test",
+            "frontend_dev": "frontend_dev",
+            "backend_dev": "backend_dev",
+            "supervisor": "supervisor",
+            "deliver": "deliver",
+        },
     )
     graph.add_conditional_edges(
         "test",
         route_after_test,
-        {"bug_fix": "fix_loop", "deliver": "deliver"},
+        {"bug_fix": "bug_fix", "deliver": "deliver"},
     )
-    graph.add_edge("fix_loop", "test")  # 修复子图结束后复测
+    graph.add_edge("bug_fix", "test")
     graph.add_edge("deliver", END)
 
-    return graph.compile()
+    return graph.compile(
+        checkpointer=checkpointer,
+        interrupt_before=[],
+        debug=False,
+    )
+
+
+def get_checkpointer():
+    """LangGraph Checkpointer 单例（SQLite 或内存）。"""
+    if not cfg.LANGGRAPH_CHECKPOINT_ENABLED:
+        return None
+    from memory.checkpoint import get_checkpointer as _get
+
+    return _get()
+
+
+def _run_config(
+    conversation_thread_id: str = "",
+    graph_thread_id: str = "",
+) -> dict | None:
+    """
+    流水线 Checkpoint 配置。
+    每次运行必须用独立 graph_thread_id，避免从上次中断的 test↔bugfix 中间态续跑。
+    """
+    if not cfg.LANGGRAPH_CHECKPOINT_ENABLED:
+        return None
+    from memory.checkpoint import thread_config
+
+    tid = (graph_thread_id or "").strip()
+    if not tid:
+        conv = (conversation_thread_id or cfg.CONVERSATION_DEFAULT_THREAD).strip()
+        tid = f"{conv}__run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    return {
+        **thread_config(tid),
+        "recursion_limit": cfg.LANGGRAPH_RECURSION_LIMIT,
+    }
 
 
 # 单例编译图
@@ -1662,10 +1987,30 @@ def _build_initial_state(
     merge_frontend_subdir: str = "",
     merge_conflict_mode: str = "",
     export_approved: bool = False,
+    conversation_thread_id: str = "",
+    conversation_history: list[dict] | None = None,
 ) -> DevState:
     """构建流水线初始状态（含可配置合并目录）。"""
     enabled = cfg.MERGE_ENABLED if merge_enabled is None else merge_enabled
     mode = (merge_conflict_mode or "").strip().lower()
+    conv_thread = (conversation_thread_id or cfg.CONVERSATION_DEFAULT_THREAD).strip()
+    graph_tid = f"{conv_thread}__run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    conv_history: list[dict] = []
+    conv_context = ""
+    if cfg.CONVERSATION_MEMORY_ENABLED:
+        try:
+            from memory import format_for_prompt, load_turns
+
+            conv_history: list[dict] = []
+            if conversation_history is not None:
+                conv_history = conversation_history
+            elif cfg.CONVERSATION_USE_JSONL:
+                conv_history = load_turns(conv_thread)
+            conv_context = format_for_prompt(
+                conv_history, current_requirement=requirement.strip()
+            )
+        except Exception as e:
+            logger.warning("对话记忆加载失败: %s", e)
     return {
         "requirement": requirement.strip(),
         "legacy_path": (legacy_path or cfg.DEFAULT_LEGACY_PATH).strip(),
@@ -1674,6 +2019,13 @@ def _build_initial_state(
         "export_approved": export_approved,
         "project_context_report": {},
         "touch_paths": {},
+        "conversation_thread_id": conv_thread,
+        "graph_thread_id": graph_tid,
+        "pipeline_step": 0,
+        "force_deliver": False,
+        "conversation_turns": conv_history,
+        "conversation_history": conv_history,
+        "conversation_context": conv_context,
         "output_dir": output_dir or str(cfg.DEFAULT_OUTPUT_DIR),
         "merge_target": (merge_target or cfg.MERGE_TARGET_ROOT).strip(),
         "merge_enabled": enabled,
@@ -1688,6 +2040,7 @@ def _build_initial_state(
         "defects": [],
         "fix_round": 0,
         "review_round": 0,
+        "review_dev_retries": 0,
         "fix_experiences": [],
         "memory_retrieved": [],
         "logs": [],
@@ -1707,6 +2060,7 @@ def run_pipeline(
     merge_frontend_subdir: str = "",
     merge_conflict_mode: str = "",
     export_approved: bool = False,
+    conversation_thread_id: str = "",
 ) -> DevState:
     """对外统一入口，供 CLI / Streamlit 调用。"""
     initial = _build_initial_state(
@@ -1718,6 +2072,8 @@ def run_pipeline(
         merge_backend_subdir,
         merge_frontend_subdir,
         merge_conflict_mode,
+        export_approved=export_approved,
+        conversation_thread_id=conversation_thread_id,
     )
     logger.info("========== 流水线启动 ==========")
     logger.info("需求: %s", requirement[:120])
@@ -1726,8 +2082,13 @@ def run_pipeline(
     if initial.get("merge_enabled"):
         logger.info("合并目标: %s", initial.get("merge_target"))
 
+    run_cfg = _run_config(
+        conversation_thread_id,
+        initial.get("graph_thread_id", ""),
+    )
+    logger.info("Checkpoint graph_thread_id=%s", run_cfg.get("configurable", {}).get("thread_id"))
     try:
-        final = PIPELINE.invoke(initial)
+        final = PIPELINE.invoke(initial, config=run_cfg)
     except Exception:
         logger.error("流水线异常:\n%s", traceback.format_exc())
         initial["errors"] = [traceback.format_exc()]
@@ -1746,6 +2107,7 @@ def run_pipeline_stream(
     merge_backend_subdir: str = "",
     merge_frontend_subdir: str = "",
     merge_conflict_mode: str = "",
+    conversation_thread_id: str = "",
 ):
     """
     流式执行流水线，逐步 yield 进度事件（供 Streamlit 实时展示）。
@@ -1760,15 +2122,30 @@ def run_pipeline_stream(
         merge_backend_subdir,
         merge_frontend_subdir,
         merge_conflict_mode,
+        conversation_thread_id=conversation_thread_id,
     )
-    yield {"type": "start", "message": "流水线启动"}
+    hist_n = len(initial.get("conversation_history") or [])
+    yield {
+        "type": "start",
+        "message": f"流水线启动（对话记忆 {hist_n} 轮）" if hist_n else "流水线启动",
+    }
     logger.info("========== 流水线流式启动 ==========")
+    if hist_n:
+        logger.info("对话记忆线程=%s 历史=%d轮", initial.get("conversation_thread_id"), hist_n)
 
     last_log_len = 0
     final_state: DevState = initial
 
     try:
-        for state in PIPELINE.stream(initial, stream_mode="values"):
+        run_cfg = _run_config(
+            conversation_thread_id,
+            initial.get("graph_thread_id", ""),
+        )
+        logger.info(
+            "Checkpoint graph_thread_id=%s",
+            (run_cfg or {}).get("configurable", {}).get("thread_id"),
+        )
+        for state in PIPELINE.stream(initial, config=run_cfg, stream_mode="values"):
             final_state = state
             logs = state.get("logs") or []
             new_logs = logs[last_log_len:]
@@ -1795,7 +2172,8 @@ def get_mermaid_diagram() -> str:
     """生成流程图（Streamlit / 文档展示）。"""
     return """
 flowchart TD
-    START([开始]) --> PW[PrepareWorkspace 隔离快照]
+    START([开始]) --> RST[ResetRun 清空上轮产物]
+    RST --> PW[PrepareWorkspace 隔离快照]
     PW --> PA[Project Analyst 项目分析]
     PA --> SUP[Supervisor Planner 任务拆分]
     SUP --> PAR{{并行扇出}}
@@ -1806,8 +2184,8 @@ flowchart TD
     JOIN --> REV[代码评审 Agent]
     REV -->|通过| TEST[测试 Agent]
     REV -->|未通过| SUP
-    TEST -->|有缺陷| FIX[缺陷修复子图]
-    FIX --> TEST
+    TEST -->|有缺陷| BF[BugFix]
+    BF --> TEST
     TEST -->|通过| DEL[交付输出]
     DEL --> END_NODE([结束])
     """

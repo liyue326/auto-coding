@@ -42,10 +42,24 @@ def prepare_legacy_workspace(legacy_path: str) -> dict[str, Any]:
     index_file = ws_root / "index" / "project_map.json"
 
     ws_root.mkdir(parents=True, exist_ok=True)
-    if snapshot.exists():
-        shutil.rmtree(snapshot)
-    shutil.copytree(source, snapshot, ignore=_ignore_copy, dirs_exist_ok=True)
-    logger.info("已复制老项目快照 → %s（原目录只读）", snapshot)
+    skipped_copy = False
+    if (
+        snapshot.is_dir()
+        and index_file.is_file()
+        and (snapshot / "frontend").is_dir()
+    ):
+        try:
+            index = json.loads(index_file.read_text(encoding="utf-8"))
+            skipped_copy = True
+            logger.info("工作区快照已存在，跳过重复复制: %s", snapshot)
+        except (json.JSONDecodeError, OSError):
+            index = build_project_index(snapshot, index_file)
+    else:
+        if snapshot.exists():
+            shutil.rmtree(snapshot)
+        shutil.copytree(source, snapshot, ignore=_ignore_copy, dirs_exist_ok=True)
+        logger.info("已复制老项目快照 → %s（原目录只读）", snapshot)
+        index = build_project_index(snapshot, index_file)
 
     if sandbox.exists():
         shutil.rmtree(sandbox)
@@ -53,7 +67,8 @@ def prepare_legacy_workspace(legacy_path: str) -> dict[str, Any]:
     (sandbox / "backend").mkdir(parents=True, exist_ok=True)
     (sandbox / "frontend").mkdir(parents=True, exist_ok=True)
 
-    index = build_project_index(snapshot, index_file)
+    if not skipped_copy and index_file.is_file():
+        index = json.loads(index_file.read_text(encoding="utf-8"))
 
     return {
         "ok": True,
@@ -64,6 +79,7 @@ def prepare_legacy_workspace(legacy_path: str) -> dict[str, Any]:
         "index_path": str(index_file),
         "index": index,
         "prepared_at": datetime.now().isoformat(timespec="seconds"),
+        "skipped_copy": skipped_copy,
     }
 
 

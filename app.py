@@ -31,6 +31,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Session State 须在侧边栏之前初始化
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+if "conversation_thread_id" not in st.session_state:
+    st.session_state.conversation_thread_id = cfg.CONVERSATION_DEFAULT_THREAD
+
 AGENT_META = {
     "PrepareWorkspace": ("📂", "隔离导入 · 快照与索引"),
     "ProjectAnalyst": ("🔬", "结构扫描 · 风格 · 可复用组件"),
@@ -88,6 +94,8 @@ with st.sidebar:
     st.title("⚙️ 运行配置")
     st.caption(f"Mock 模式: **{'开启' if cfg.USE_MOCK_LLM else '关闭'}**")
     st.caption(f"模型: `{cfg.LLM_MODEL}`")
+    if cfg.USE_STRUCTURED_OUTPUT:
+        st.caption(f"结构化输出: **{cfg.STRUCTURED_OUTPUT_METHOD}**")
     mem_on = st.checkbox(
         "修复经验库 (Chroma)",
         value=cfg.MEMORY_ENABLED,
@@ -98,9 +106,7 @@ with st.sidebar:
             from memory.store import collection_count
 
             n = collection_count()
-            st.caption(f"库内成功修复案例: **{n}** 条")
-            if n <= 1:
-                st.caption("条数少通常因：Mock/一次通过未进 BugFix，或仅跑过 1 次带修复的流水线")
+            st.caption(f"库内案例: **{n}** 条")
         except Exception:
             st.caption("库内案例: （未安装 chromadb 或尚未初始化）")
     output_dir = st.text_input("输出根目录", value=str(cfg.DEFAULT_OUTPUT_DIR))
@@ -151,6 +157,58 @@ with st.sidebar:
             f"将合并到：`{merge_target}/{merge_be}` 与 `{merge_target}/{merge_fe}` · 策略 `{merge_mode}`"
         )
 
+    st.markdown("**多轮对话记忆**")
+    conv_on = st.checkbox(
+        "启用对话记忆",
+        value=cfg.CONVERSATION_MEMORY_ENABLED,
+        help="默认用 LangGraph SqliteSaver Checkpoint 按 thread_id 持久化；可选 JSONL 双写",
+    )
+    thread_id = st.text_input(
+        "对话线程 ID",
+        value=st.session_state.conversation_thread_id,
+        help="同一 ID 共享历史，例如 default / project-all",
+    )
+    st.session_state.conversation_thread_id = (thread_id or cfg.CONVERSATION_DEFAULT_THREAD).strip()
+    if conv_on:
+        try:
+            from memory import load_turns
+
+            from memory.checkpoint import load_conversation_turns
+            from pipeline import PIPELINE
+
+            tid = st.session_state.conversation_thread_id
+            turns = []
+            if cfg.CONVERSATION_USE_CHECKPOINT and cfg.LANGGRAPH_CHECKPOINT_ENABLED:
+                turns = load_conversation_turns(PIPELINE, tid)
+            if not turns and cfg.CONVERSATION_USE_JSONL:
+                turns = load_turns(tid)
+            st.caption(
+                f"本线程 **{len(turns)}** 轮对话记忆（每次点「启动流水线」+1，与单次需求内节点次数无关）"
+            )
+            with st.expander("历史对话", expanded=False):
+                for t in turns[-5:]:
+                    st.markdown(f"**{t.get('timestamp', '')}** · {t.get('requirement', '')[:60]}")
+                    st.caption(t.get("summary", ""))
+            if st.button("清空本线程对话", use_container_width=True):
+                from memory import clear_thread
+                from memory.checkpoint import clear_thread_checkpoint
+                from pipeline import PIPELINE
+
+                tid = st.session_state.conversation_thread_id
+                if cfg.CONVERSATION_USE_CHECKPOINT:
+                    clear_thread_checkpoint(PIPELINE, tid)
+                if cfg.CONVERSATION_USE_JSONL:
+                    clear_thread(tid)
+                st.success("已清空（Checkpoint + JSONL）")
+                st.rerun()
+            if cfg.LANGGRAPH_CHECKPOINT_ENABLED:
+                st.caption(
+                    f"Checkpoint: `{cfg.LANGGRAPH_CHECKPOINT_DB}` · "
+                    f"thread_id = 对话线程 ID"
+                )
+        except Exception as e:
+            st.caption(f"对话记忆不可用: {e}")
+
     legacy_path = st.text_input(
         "存量项目路径（可选，任意本地目录）",
         value=cfg.DEFAULT_LEGACY_PATH or "",
@@ -198,9 +256,6 @@ col_run, col_clear = st.columns([1, 4])
 with col_run:
     run_btn = st.button("▶ 启动流水线", type="primary", use_container_width=True)
 
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-
 if run_btn:
     if not requirement.strip():
         st.error("请填写业务需求")
@@ -225,6 +280,11 @@ if run_btn:
             "Deliver": 100,
         }
 
+        conv_thread = (
+            st.session_state.conversation_thread_id
+            if conv_on
+            else ""
+        )
         for event in run_pipeline_stream(
             requirement=requirement,
             legacy_path=legacy_path or "",
@@ -234,6 +294,7 @@ if run_btn:
             merge_backend_subdir=merge_be,
             merge_frontend_subdir=merge_fe,
             merge_conflict_mode=merge_mode if merge_enabled else "",
+            conversation_thread_id=conv_thread,
         ):
             etype = event.get("type")
             if etype == "start":
@@ -245,8 +306,14 @@ if run_btn:
                 state = event.get("state") or {}
                 phase = event.get("phase") or state.get("phase") or ""
                 new_logs = event.get("logs") or []
-                all_logs.extend(new_logs)
-                log_live.code("\n".join(all_logs))
+                if new_logs:
+                    all_logs.extend(new_logs)
+                    log_live.code("\n".join(all_logs[-80:]))
+                    log_live.caption(
+                        f"▶ 当前节点: **{phase or '…'}** · 本步新增 {len(new_logs)} 条 · 累计 {len(all_logs)} 条"
+                    )
+                else:
+                    log_live.code("\n".join(all_logs[-80:]) if all_logs else "（等待日志…）")
 
                 pct = phase_weights.get(phase, 0)
                 if pct:
@@ -280,6 +347,15 @@ if run_btn:
                 break
 
         st.session_state.last_result = result
+        if conv_on and result:
+            try:
+                from memory import load_turns
+
+                st.session_state.conversation_turn_count = len(
+                    load_turns(st.session_state.conversation_thread_id)
+                )
+            except Exception:
+                pass
 
 if col_clear.button("清空结果"):
     st.session_state.last_result = None
@@ -324,6 +400,13 @@ if result:
         st.info(f"本次开发范围：**{scope}**（fullstack=全栈 · frontend_only=仅前端 · backend_only=仅后端）")
     render_agent_cards(result.get("agent_outputs") or {})
 
+    conv_hist = result.get("conversation_history") or []
+    if conv_hist:
+        with st.expander(f"多轮对话记忆（本线程 {len(conv_hist)} 轮）"):
+            for t in conv_hist[-8:]:
+                st.markdown(f"**{t.get('timestamp', '')}** — {t.get('requirement', '')}")
+                st.caption(t.get("summary", ""))
+
     report = result.get("project_context_report") or {}
     if report.get("ok"):
         with st.expander("Project Analyst 项目上下文报告"):
@@ -347,6 +430,22 @@ if result:
     out = result.get("output_dir")
     if out and Path(out).exists():
         st.info(f"代码已写入独立目录: `{out}`")
+        summary_path = Path(out) / "reports" / "summary.json"
+        if summary_path.exists():
+            try:
+                summ = json.loads(summary_path.read_text(encoding="utf-8"))
+                mi = summ.get("memory_ingested", 0)
+                test_ok = (summ.get("test") or {}).get("passed")
+                if mi:
+                    st.caption(f"本次已入库修复经验 **{mi}** 条")
+                elif summ.get("fix_experiences") or result.get("fix_round"):
+                    st.caption(
+                        "本次 **未入库**（通常因最终测试未通过；详见上方日志 `[Deliver] 修复经验未入库`）"
+                    )
+                elif test_ok:
+                    st.caption("本次测试通过但未经历 BugFix，修复经验库不增加条数")
+            except Exception:
+                pass
 
     merge = result.get("merge_result") or {}
     if merge.get("needs_manual_resolution"):

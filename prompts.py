@@ -50,7 +50,11 @@ def build_system(agent: str) -> str:
 def build_user(agent: str, **ctx) -> str:
     """按角色组装 user prompt。"""
     tpl = _USER[agent]
-    return tpl.format(**{k: v for k, v in ctx.items()})
+    defaults = {"conversation_history": "（无）"}
+    merged = {**defaults, **ctx}
+    return tpl.format_map(
+        {k: ("" if v is None else v) for k, v in merged.items()}
+    )
 
 
 # ── System Prompts（角色 + 约束 + 输出格式）────────────────────────────
@@ -66,7 +70,7 @@ _SYSTEM = {
 
 ## 原则
 - 只分析只读快照，不要求生成业务代码
-- 结合用户本次需求，不要臆测成无关业务（如强行登录/笔记 CRUD）
+- 结合用户本次需求与多轮对话记忆，不要臆测成无关业务（如强行登录/笔记 CRUD）
 - 输出必须可执行，便于后续 Agent 直接遵循
 
 ## 输出要求
@@ -88,6 +92,7 @@ _SYSTEM = {
 - 判断 scope：只需前端、只需后端、或全栈；不要派发用户未要求的角色
 - api_contract 仅在需要前后端协作时填写；纯前端/纯展示可为 {}
 - **必须依据 Project Analyst 的项目上下文报告**拆分任务，标注改造注意事项
+- 结合「多轮对话记忆」理解指代（如「再加」「同上」「在刚才那个页面」），但以**本次业务需求**为准
 
 ## scope 取值（必填）
 - fullstack: 需要前后端协作
@@ -154,6 +159,9 @@ _USER = {
     "project_analyst": """## 业务需求（本次开发目标）
 {requirement}
 
+## 多轮对话记忆
+{conversation_history}
+
 ## 工作区信息
 {workspace_info}
 
@@ -167,12 +175,18 @@ _USER = {
     "supervisor": """## 业务需求
 {requirement}
 
+## 多轮对话记忆
+{conversation_history}
+
 ## Project Analyst 项目上下文报告（必读）
 {project_context}
 
 请输出 scope、tasks、api_contract JSON。""",
     "backend": """## 业务需求
 {requirement}
+
+## 多轮对话记忆
+{conversation_history}
 
 ## 老项目上下文（只读，在此结构上扩展）
 {legacy_context}
@@ -192,6 +206,9 @@ _USER = {
 请生成后端 files JSON；若上方列出了已有文件，只输出这些路径的完整修改后内容。""",
     "frontend": """## 业务需求（必须逐字落实）
 {requirement}
+
+## 多轮对话记忆
+{conversation_history}
 
 ## 老项目上下文（只读，在此结构上扩展）
 {legacy_context}
@@ -238,6 +255,9 @@ _USER = {
     "bug_fix": """## 缺陷清单
 {defects}
 
+## 多轮对话记忆
+{conversation_history}
+
 ## 当前后端文件
 {backend_files}
 
@@ -245,6 +265,12 @@ _USER = {
 {frontend_files}
 
 {fix_experience_hints}
+
+## 改造模式
+{modify_mode}
+
+## 待修改已有文件（快照原文，必须保留原功能）
+{existing_files}
 
 请输出修复后的 files JSON。""",
 }

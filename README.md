@@ -78,6 +78,23 @@ MERGE_CONFLICT_MODE=overwrite
 | `MEMORY_TOP_K` | BugFix 检索历史案例条数，默认 `3` |
 | `EMBEDDING_MODEL` | 嵌入模型，默认 `text-embedding-v3`（DashScope） |
 
+### 多轮对话记忆（LangGraph Checkpoint）
+
+| 变量 | 说明 |
+|------|------|
+| `LANGGRAPH_CHECKPOINT_ENABLED` | 编译图时挂载 Checkpointer |
+| `LANGGRAPH_CHECKPOINT_DB` | SQLite 路径，默认 `data/checkpoints/langgraph.db` |
+| `CONVERSATION_MEMORY_ENABLED` | 启用多轮对话记忆 |
+| `CONVERSATION_USE_CHECKPOINT` | 从 Checkpoint 读/写 `conversation_turns`（默认 `true`） |
+| `CONVERSATION_USE_JSONL` | 是否双写 JSONL（默认 `false`） |
+| `CONVERSATION_MAX_TURNS` | 注入 Prompt 的历史轮数 |
+| `CONVERSATION_DEFAULT_THREAD` | 默认 `thread_id`（= 侧边栏「对话线程 ID」） |
+
+- 技术：**LangGraph 自带 `SqliteSaver`** + `thread_id`；状态里 `conversation_turns` 列表追加每轮摘要
+- 每次新需求：`reset_run` 清空上一轮代码产物，**不**清空对话轮次
+- 依赖：`pip install langgraph-checkpoint-sqlite`
+- 与 Chroma **修复经验库** 独立
+
 ### 修复经验向量库（Chroma）
 
 - **只入库成功修复**：流水线 **测试通过** 且经历过 **BugFix** 时，Deliver 写入**最后一轮**修复记录

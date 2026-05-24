@@ -38,6 +38,19 @@ else:
 MAX_FIX_ROUNDS: int = int(os.getenv("MAX_FIX_ROUNDS", "3"))
 MAX_REVIEW_RETRIES: int = int(os.getenv("MAX_REVIEW_RETRIES", "2"))
 NODE_RETRY_ATTEMPTS: int = int(os.getenv("NODE_RETRY_ATTEMPTS", "2"))
+# 单次流水线最多执行节点步数（防止 Checkpoint 续跑或路由死循环）
+MAX_PIPELINE_STEPS: int = int(os.getenv("MAX_PIPELINE_STEPS", "40"))
+# LangGraph 图级递归上限（与 MAX_PIPELINE_STEPS 双保险）
+LANGGRAPH_RECURSION_LIMIT: int = int(os.getenv("LANGGRAPH_RECURSION_LIMIT", "45"))
+
+# 结构化输出（Function Calling / JSON Schema，减少 JSON 解析失败与重试）
+USE_STRUCTURED_OUTPUT: bool = os.getenv(
+    "USE_STRUCTURED_OUTPUT", "true"
+).strip().lower() in ("1", "true", "yes")
+# function_calling | json_schema | json_mode
+STRUCTURED_OUTPUT_METHOD: str = os.getenv(
+    "STRUCTURED_OUTPUT_METHOD", "function_calling"
+).strip().lower()
 
 # 代码评审通过阈值（0-100）
 REVIEW_PASS_SCORE: int = int(os.getenv("REVIEW_PASS_SCORE", "75"))
@@ -108,6 +121,43 @@ CHROMA_PERSIST_DIR: Path = Path(
 ).expanduser()
 CHROMA_COLLECTION: str = os.getenv("CHROMA_COLLECTION", "fix_experiences").strip()
 MEMORY_TOP_K: int = int(os.getenv("MEMORY_TOP_K", "3"))
+
+# ── 多轮对话记忆（JSONL 持久化，注入 Planner / Dev Prompt）──────────────
+CONVERSATION_MEMORY_ENABLED: bool = os.getenv(
+    "CONVERSATION_MEMORY_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+CONVERSATION_PERSIST_DIR: Path = Path(
+    os.getenv(
+        "CONVERSATION_PERSIST_DIR",
+        str(PROJECT_ROOT / "data" / "conversations"),
+    )
+).expanduser()
+CONVERSATION_MAX_TURNS: int = int(os.getenv("CONVERSATION_MAX_TURNS", "8"))
+CONVERSATION_MAX_CHARS: int = int(os.getenv("CONVERSATION_MAX_CHARS", "3500"))
+CONVERSATION_DEFAULT_THREAD: str = os.getenv(
+    "CONVERSATION_DEFAULT_THREAD", "default"
+).strip() or "default"
+# 多轮记忆主存储：checkpoint=LangGraph SqliteSaver；jsonl=旧版 JSONL（可双写）
+CONVERSATION_USE_CHECKPOINT: bool = os.getenv(
+    "CONVERSATION_USE_CHECKPOINT", "true"
+).strip().lower() in ("1", "true", "yes")
+CONVERSATION_USE_JSONL: bool = os.getenv(
+    "CONVERSATION_USE_JSONL", "true"
+).strip().lower() in ("1", "true", "yes")
+
+# ── LangGraph Checkpoint（流水线状态 + 对话 thread 持久化）────────────
+LANGGRAPH_CHECKPOINT_ENABLED: bool = os.getenv(
+    "LANGGRAPH_CHECKPOINT_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes")
+LANGGRAPH_CHECKPOINT_SQLITE: bool = os.getenv(
+    "LANGGRAPH_CHECKPOINT_SQLITE", "true"
+).strip().lower() in ("1", "true", "yes")
+LANGGRAPH_CHECKPOINT_DB: Path = Path(
+    os.getenv(
+        "LANGGRAPH_CHECKPOINT_DB",
+        str(PROJECT_ROOT / "data" / "checkpoints" / "langgraph.db"),
+    )
+).expanduser()
 # DashScope 兼容接口常用 text-embedding-v3；OpenAI 官方可用 text-embedding-3-small
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v3").strip()
 

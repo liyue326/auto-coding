@@ -1,8 +1,11 @@
 .env
 output/
 data/chroma/
+data/conversations/
+data/checkpoints/
 # 老项目隔离工作区（快照/索引/导出包，运行时自动生成，勿提交）
 data/workspaces/
 __pycache__/
 *.pyc
 .streamlit/
+.DS_Store

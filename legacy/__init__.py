@@ -7,9 +7,13 @@ from legacy.analyst import (
 )
 from legacy.indexer import build_project_index
 from legacy.files import (
+    apply_requirement_on_baseline,
+    coalesce_with_baseline,
     format_existing_files_block,
     infer_touch_paths,
     load_source_files,
+    parse_existing_files_from_prompt,
+    preserves_baseline,
     wants_modify_existing,
 )
 from legacy.repair import repair_nested_merge_dirs
@@ -35,4 +39,8 @@ __all__ = [
     "load_source_files",
     "wants_modify_existing",
     "format_existing_files_block",
+    "coalesce_with_baseline",
+    "apply_requirement_on_baseline",
+    "preserves_baseline",
+    "parse_existing_files_from_prompt",
 ]

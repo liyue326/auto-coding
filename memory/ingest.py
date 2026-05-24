@@ -68,12 +68,26 @@ def _metadata_for_case(
     }
 
 
+def ingest_skip_reason(state: dict[str, Any]) -> str:
+    """说明本次 run 为何未/将入库（供 Deliver 日志与 UI）。"""
+    if not cfg.MEMORY_ENABLED:
+        return "MEMORY_ENABLED 未开启"
+    experiences = state.get("fix_experiences") or []
+    if not experiences:
+        return "本次未进入 BugFix（fix_experiences 为空）"
+    if not state.get("test_passed"):
+        n = len(experiences)
+        return (
+            f"最终测试未通过（经历 {n} 轮 BugFix，但仅入库「测试通过」的成功案例）"
+        )
+    return ""
+
+
 def should_ingest_run(state: dict[str, Any]) -> bool:
     """仅：测试通过 + 至少一轮 BugFix 记录。"""
-    if not state.get("test_passed"):
+    if ingest_skip_reason(state):
         return False
-    experiences = state.get("fix_experiences") or []
-    return len(experiences) > 0
+    return True
 
 
 def ingest_successful_run(state: dict[str, Any], run_id: str = "") -> int:
