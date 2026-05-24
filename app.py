@@ -70,6 +70,68 @@ def render_agent_cards(outputs: dict):
                 st.json(data)
 
 
+def render_code_changes(result: dict):
+    """展示相对老项目快照的代码变更（unified diff）。"""
+    changes = result.get("code_changes") or {}
+    if not changes and result.get("output_dir"):
+        path = Path(result["output_dir"]) / "reports" / "changes.json"
+        if path.exists():
+            try:
+                changes = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                changes = {}
+
+    if not changes:
+        return
+
+    st.subheader("代码变更")
+    summary = changes.get("summary") or {}
+    st.caption(changes.get("text_summary") or "")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("修改", summary.get("modified", 0))
+    with c2:
+        st.metric("新增", summary.get("added", 0))
+    with c3:
+        st.metric("测试文件", summary.get("generated", 0))
+    with c4:
+        st.metric("未变", summary.get("unchanged", 0))
+
+    interesting = [
+        f
+        for f in (changes.get("files") or [])
+        if f.get("status") in ("modified", "new", "generated")
+    ]
+    if not interesting:
+        st.info("相对快照无实质变更（或无可对比基线）。")
+        return
+
+    for item in interesting:
+        side = item.get("side", "")
+        path = item.get("path", "")
+        status = item.get("status", "")
+        badge = {"modified": "修改", "new": "新建", "generated": "测试"}.get(status, status)
+        title = f"`{side}/{path}` · **{badge}** · {item.get('summary', '')}"
+        with st.expander(title, expanded=(status == "modified" and len(interesting) <= 3)):
+            diff_text = item.get("unified_diff") or ""
+            if diff_text:
+                if item.get("truncated"):
+                    st.caption("diff 过长，已截断；完整内容见输出目录 reports/patches/")
+                st.code(diff_text, language="diff")
+            elif status == "new":
+                be = (result.get("backend_files") or {}).get(path)
+                fe = (result.get("frontend_files") or {}).get(path)
+                code = be or fe or ""
+                if code:
+                    lang = "python" if path.endswith(".py") else (
+                        "javascript" if path.endswith(".js") else "html"
+                    )
+                    st.code(code, language=lang)
+            else:
+                st.caption("无 diff 文本")
+
+
 def render_code_preview(result: dict):
     st.subheader("生成代码预览")
     tab_be, tab_fe = st.tabs(["后端文件", "前端文件"])
@@ -425,6 +487,7 @@ if result:
         with st.expander("测试结果 / 缺陷清单"):
             st.json(test)
 
+    render_code_changes(result)
     render_code_preview(result)
 
     out = result.get("output_dir")

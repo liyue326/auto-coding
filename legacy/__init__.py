@@ -16,6 +16,7 @@ from legacy.files import (
     preserves_baseline,
     wants_modify_existing,
 )
+from legacy.diff import compute_code_changes, format_changes_log_line
 from legacy.repair import repair_nested_merge_dirs
 from legacy.workspace import (
     build_export_package,
@@ -43,4 +44,6 @@ __all__ = [
     "apply_requirement_on_baseline",
     "preserves_baseline",
     "parse_existing_files_from_prompt",
+    "compute_code_changes",
+    "format_changes_log_line",
 ]

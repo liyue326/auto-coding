@@ -111,6 +111,7 @@ class DevState(TypedDict, total=False):
     test_passed: bool
     delivered: bool
     force_deliver: bool
+    code_changes: dict
 
     # 可观测性
     logs: Annotated[list[str], _append_logs]
@@ -1654,6 +1655,36 @@ def node_deliver(state: DevState) -> dict:
     state_for_write["output_dir"] = str(out)
     write_artifacts(out, state_for_write)
 
+    code_changes: dict = {}
+    ws = state.get("legacy_workspace") or {}
+    try:
+        from legacy import compute_code_changes, format_changes_log_line
+
+        code_changes = compute_code_changes(
+            ws,
+            state.get("backend_files") or {},
+            state.get("frontend_files") or {},
+        )
+        updates["code_changes"] = code_changes
+        (out / "reports").mkdir(parents=True, exist_ok=True)
+        (out / "reports" / "changes.json").write_text(
+            json.dumps(code_changes, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        for item in code_changes.get("files") or []:
+            if item.get("status") not in ("modified", "new") or not item.get("unified_diff"):
+                continue
+            patch_name = f"{item['side']}_{item['path'].replace('/', '__')}.patch"
+            (out / "reports" / "patches").mkdir(parents=True, exist_ok=True)
+            (out / "reports" / "patches" / patch_name).write_text(
+                item["unified_diff"], encoding="utf-8"
+            )
+        updates["logs"] = updates.get("logs", []) + [
+            f"[Deliver] {format_changes_log_line(code_changes)}"
+        ]
+    except Exception as e:
+        logger.warning("代码变更对比失败: %s", e)
+
     # 若指定存量路径，复制分析快照（只读引用，不改原文件）
     legacy = state.get("legacy_path")
     if legacy:
@@ -1663,7 +1694,6 @@ def node_deliver(state: DevState) -> dict:
 
     merge_result: dict = {"ok": False, "skipped": True, "reason": "export_pending"}
     export_pkg: dict = {}
-    ws = state.get("legacy_workspace") or {}
     req = state.get("requirement", "")
     legacy_target = (state.get("legacy_path") or cfg.DEFAULT_LEGACY_PATH).strip()
 
@@ -1789,6 +1819,7 @@ def node_deliver(state: DevState) -> dict:
                 "export_package": export_pkg,
                 "legacy_path": legacy_target,
                 "output_dir": str(out),
+                "code_changes": code_changes,
             },
             ensure_ascii=False,
             indent=2,
@@ -1801,6 +1832,7 @@ def node_deliver(state: DevState) -> dict:
         "merge": merge_result,
         "export_package": export_pkg,
         "memory_ingested": memory_ingested,
+        "code_changes_summary": (code_changes.get("text_summary") if code_changes else ""),
     }
     updates.update(
         {
@@ -1808,6 +1840,7 @@ def node_deliver(state: DevState) -> dict:
             "output_dir": str(out),
             "merge_result": merge_result,
             **_save_agent_output(state, "Deliver", deliver_payload),
+            "code_changes": code_changes,
         }
     )
     logger.info("Deliver 输出目录: %s memory_ingested=%s", out, memory_ingested)
