@@ -75,6 +75,20 @@ def postgres_spec() -> MCPServerSpec | None:
     )
 
 
+def github_spec() -> MCPServerSpec | None:
+    if not cfg.GITHUB_MCP_ENABLED or not cfg.GITHUB_TOKEN:
+        return None
+    env = dict(os.environ)
+    env["GITHUB_PERSONAL_ACCESS_TOKEN"] = cfg.GITHUB_TOKEN
+    env["GITHUB_TOKEN"] = cfg.GITHUB_TOKEN
+    return MCPServerSpec(
+        name="github",
+        command=cfg.GITHUB_MCP_COMMAND,
+        args=_parse_args(cfg.GITHUB_MCP_ARGS),
+        env=env,
+    )
+
+
 def _tool_result_to_text(result: Any) -> str:
     if result is None:
         return ""

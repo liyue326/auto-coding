@@ -961,7 +961,7 @@ def _mcp_framework_docs(state: DevState, side: str) -> str:
     if not cfg.MCP_ENABLED or not cfg.MCP_DOCS_ENABLED:
         return "（MCP 文档检索未启用）"
     try:
-        from mcp import fetch_framework_docs
+        from mcp_tools import fetch_framework_docs
 
         block, _meta = fetch_framework_docs(
             state.get("requirement", ""),
@@ -1370,7 +1370,7 @@ def node_code_review(state: DevState) -> dict:
     mcp_meta: dict = {}
     if cfg.MCP_ENABLED and cfg.MCP_SQL_ENABLED and scope != "frontend_only":
         try:
-            from mcp import validate_backend_schema
+            from mcp_tools import validate_backend_schema
 
             sql_issues, mcp_meta = validate_backend_schema(
                 backend, for_review=True
@@ -1526,7 +1526,7 @@ def node_test(state: DevState) -> dict:
     mcp_report: dict = dict(state.get("mcp_results") or {})
     if cfg.MCP_ENABLED and cfg.MCP_SQL_ENABLED and scope != "frontend_only":
         try:
-            from mcp import validate_backend_schema
+            from mcp_tools import validate_backend_schema
 
             sql_defects, sql_meta = validate_backend_schema(backend)
             defects.extend(sql_defects)
@@ -1540,7 +1540,7 @@ def node_test(state: DevState) -> dict:
 
     if cfg.MCP_ENABLED and cfg.MCP_PLAYWRIGHT_ENABLED and scope != "backend_only":
         try:
-            from mcp import run_playwright_checks
+            from mcp_tools import run_playwright_checks
 
             e2e_defects, e2e_meta = run_playwright_checks(
                 state.get("requirement", ""),
@@ -1602,8 +1602,11 @@ def node_test(state: DevState) -> dict:
             **_save_agent_output(state, "TestAgent", result),
         }
     )
-    # 写入测试文件到 state 供后续落盘
-    updates["backend_files"] = {f"tests/{k}": v for k, v in test_files.items()}
+    # 测试文件合并进 backend_files（勿覆盖 Dev 产物）
+    if test_files:
+        merged_be = dict(state.get("backend_files") or {})
+        merged_be.update({f"tests/{k}": v for k, v in test_files.items()})
+        updates["backend_files"] = merged_be
     logger.info("TestAgent 缺陷数=%d 通过=%s", len(defects), passed)
     return updates
 
@@ -1895,6 +1898,28 @@ def node_deliver(state: DevState) -> dict:
         except Exception as e:
             logger.warning("对话记忆保存失败: %s", e)
 
+    github_result: dict = {}
+    if cfg.GITHUB_MCP_ENABLED:
+        try:
+            from mcp_tools.github_pr import create_github_pr_from_deliver
+
+            final_for_gh = {**state, **updates, "output_dir": str(out)}
+            github_result = create_github_pr_from_deliver(
+                final_for_gh, code_changes, output_dir=out
+            )
+            if github_result.get("ok"):
+                updates["logs"] = updates.get("logs", []) + [
+                    f"[Deliver] GitHub PR: {github_result.get('pr_url')} "
+                    f"（{github_result.get('branch')} → {github_result.get('base')} · "
+                    f"{github_result.get('files_count', 0)} 文件）"
+                ]
+            elif not github_result.get("skipped"):
+                updates["logs"] = updates.get("logs", []) + [
+                    f"[Deliver] GitHub PR 失败: {github_result.get('error') or github_result.get('push_detail')}"
+                ]
+        except Exception as e:
+            logger.warning("GitHub PR 跳过: %s", e)
+
     (out / "reports" / "summary.json").write_text(
         json.dumps(
             {
@@ -1912,6 +1937,7 @@ def node_deliver(state: DevState) -> dict:
                 "legacy_path": legacy_target,
                 "output_dir": str(out),
                 "code_changes": code_changes,
+                "github_pr": github_result,
             },
             ensure_ascii=False,
             indent=2,
@@ -1925,6 +1951,7 @@ def node_deliver(state: DevState) -> dict:
         "export_package": export_pkg,
         "memory_ingested": memory_ingested,
         "code_changes_summary": (code_changes.get("text_summary") if code_changes else ""),
+        "github_pr": github_result,
     }
     updates.update(
         {
@@ -1933,6 +1960,7 @@ def node_deliver(state: DevState) -> dict:
             "merge_result": merge_result,
             **_save_agent_output(state, "Deliver", deliver_payload),
             "code_changes": code_changes,
+            "github_pr": github_result,
         }
     )
     logger.info("Deliver 输出目录: %s memory_ingested=%s", out, memory_ingested)

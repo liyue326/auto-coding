@@ -11,6 +11,13 @@
     "fetch": {
       "command": "npx",
       "args": ["-y", "@modelcontextprotocol/server-fetch@latest"]
+    },
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github@latest"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      }
     }
   }
 }

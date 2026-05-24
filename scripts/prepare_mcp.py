@@ -30,6 +30,12 @@ def _fail(msg: str) -> None:
 def check_python_deps() -> bool:
     print("\n[1/5] Python 依赖")
     ok = True
+    ver = sys.version_info
+    if ver < (3, 10):
+        _fail(f"Python {ver.major}.{ver.minor} 过低，mcp 包需 3.10+，请运行: bash scripts/setup_venv.sh")
+        ok = False
+    else:
+        _ok(f"Python {ver.major}.{ver.minor}.{ver.micro}")
     for pkg in ("mcp", "langgraph", "langchain_openai", "streamlit"):
         if importlib.util.find_spec(pkg.replace("-", "_").split(".")[0]) is None:
             _fail(f"缺少 {pkg}，请 pip install -r requirements.txt")
@@ -61,7 +67,7 @@ def check_node() -> bool:
 def check_sql_module() -> bool:
     print("\n[3/5] SQL 校验（本地 SQLite，无需 MCP Server）")
     try:
-        from mcp.sql_check import validate_backend_schema
+        from mcp_tools.sql_check import validate_backend_schema
 
         issues, meta = validate_backend_schema(
             {"schema.sql": "CREATE TABLE t (id INTEGER PRIMARY KEY);"}
@@ -79,7 +85,7 @@ def check_sql_module() -> bool:
 def probe_mcp_server(label: str, command: str, args: list[str], env: dict | None = None) -> None:
     """尝试 import mcp 并短超时连接（仅打印结果，不阻断）。"""
     try:
-        from mcp.client import MCPServerSpec, call_mcp_tool
+        from mcp_tools.client import MCPServerSpec, call_mcp_tool
 
         spec = MCPServerSpec(label, command, args, env or {})
         ok, msg = call_mcp_tool(spec, "list_tools_probe", {}, timeout=8)

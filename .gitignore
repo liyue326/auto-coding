@@ -9,3 +9,4 @@ __pycache__/
 *.pyc
 .streamlit/
 .DS_Store
+.venv

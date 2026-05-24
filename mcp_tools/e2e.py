@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 import config as cfg
-from mcp.client import call_mcp_tool, playwright_spec
+from mcp_tools.client import call_mcp_tool, playwright_spec
 
 logger = logging.getLogger("multi-agent.mcp")
 

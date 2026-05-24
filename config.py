@@ -231,3 +231,36 @@ MCP_POSTGRES_COMMAND: str = os.getenv("MCP_POSTGRES_COMMAND", "npx").strip()
 MCP_POSTGRES_ARGS: str = os.getenv(
     "MCP_POSTGRES_ARGS", "-y,@modelcontextprotocol/server-postgres@latest"
 ).strip()
+
+# GitHub MCP — Deliver 后 push 代码并开 PR
+GITHUB_MCP_ENABLED: bool = os.getenv("GITHUB_MCP_ENABLED", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+GITHUB_TOKEN: str = os.getenv(
+    "GITHUB_TOKEN", os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN", "")
+).strip()
+GITHUB_OWNER: str = os.getenv("GITHUB_OWNER", "liyue326").strip()
+GITHUB_REPO: str = os.getenv("GITHUB_REPO", "test").strip()
+GITHUB_REPO_URL: str = os.getenv("GITHUB_REPO_URL", "").strip()
+# 仓库内子目录，如 test 仓库的 all/backend → GITHUB_REPO_SUBDIR=all
+GITHUB_REPO_SUBDIR: str = os.getenv("GITHUB_REPO_SUBDIR", "all").strip().strip("/")
+GITHUB_BASE_BRANCH: str = os.getenv("GITHUB_BASE_BRANCH", "main").strip()
+GITHUB_BRANCH_PREFIX: str = os.getenv("GITHUB_BRANCH_PREFIX", "agent").strip()
+GITHUB_MCP_PUSH: bool = os.getenv("GITHUB_MCP_PUSH", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+GITHUB_PR_DRAFT: bool = os.getenv("GITHUB_PR_DRAFT", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+GITHUB_MCP_MAX_FILES: int = int(os.getenv("GITHUB_MCP_MAX_FILES", "35"))
+GITHUB_MCP_MAX_FILE_CHARS: int = int(os.getenv("GITHUB_MCP_MAX_FILE_CHARS", "80000"))
+GITHUB_MCP_COMMAND: str = os.getenv("GITHUB_MCP_COMMAND", "npx").strip()
+GITHUB_MCP_ARGS: str = os.getenv(
+    "GITHUB_MCP_ARGS", "-y,@modelcontextprotocol/server-github@latest"
+).strip()

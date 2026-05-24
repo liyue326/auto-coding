@@ -233,9 +233,12 @@ with st.sidebar:
     st.caption(
         f"文档 MCP: Context7={'开' if cfg.MCP_CONTEXT7_ENABLED else '关'} · "
         f"Fetch={'开' if cfg.MCP_FETCH_ENABLED else '关'} · "
-        f"SQL={'开' if cfg.MCP_SQL_ENABLED else '关'} · "
-        f"Postgres={'开' if cfg.MCP_POSTGRES_ENABLED else '关'}"
+        f"SQL={'开' if cfg.MCP_SQL_ENABLED else '关'}"
     )
+    if cfg.GITHUB_MCP_ENABLED:
+        gh = f"{cfg.GITHUB_OWNER}/{cfg.GITHUB_REPO}" if cfg.GITHUB_REPO else "未配置"
+        gt = "已配置" if cfg.GITHUB_TOKEN else "未配置 GITHUB_TOKEN"
+        st.caption(f"GitHub PR: `{gh}` → `{cfg.GITHUB_BASE_BRANCH}` · Token: {gt}")
     if st.button("运行 MCP 自检", help="等同 python3 scripts/prepare_mcp.py"):
         import subprocess
 
@@ -514,6 +517,14 @@ if result:
     if test:
         with st.expander("测试结果 / 缺陷清单"):
             st.json(test)
+
+    github_pr = result.get("github_pr") or (result.get("agent_outputs") or {}).get("Deliver", {}).get("github_pr") or {}
+    if github_pr and github_pr.get("pr_url"):
+        st.success(f"GitHub PR: [{github_pr.get('pr_url')}]({github_pr.get('pr_url')})")
+    elif github_pr and not github_pr.get("skipped"):
+        err = github_pr.get("error") or github_pr.get("push_detail")
+        if err:
+            st.caption(f"GitHub PR 未创建: {err}")
 
     mcp_results = result.get("mcp_results") or (test or {}).get("mcp") or {}
     if mcp_results:

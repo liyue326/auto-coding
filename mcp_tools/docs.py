@@ -8,7 +8,7 @@ import urllib.request
 from typing import Any
 
 import config as cfg
-from mcp.client import call_mcp_tool, context7_spec, fetch_spec, parse_jsonish
+from mcp_tools.client import call_mcp_tool, context7_spec, fetch_spec, parse_jsonish
 
 logger = logging.getLogger("multi-agent.mcp")
 
